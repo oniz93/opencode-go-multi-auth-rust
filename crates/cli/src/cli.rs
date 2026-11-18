@@ -169,7 +169,19 @@ fn strategy_name(strategy: RoutingStrategy) -> &'static str {
 }
 
 pub fn run(args: Vec<String>) -> anyhow::Result<RunOutcome> {
-    let cli = Cli::try_parse_from(args)?;
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            use clap::error::ErrorKind;
+            match err.kind() {
+                // `--help` / `--version` are successful exits, not failures.
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                    return Ok(RunOutcome::Text(err.to_string()));
+                }
+                _ => return Err(err.into()),
+            }
+        }
+    };
     let keys_path = cli.keys.unwrap_or_else(default_keys_path);
     let config_path = cli.config.unwrap_or_else(default_config_path);
 

@@ -89,3 +89,12 @@ fn secret_dash_reads_one_line_from_stdin() {
         "literal"
     );
 }
+
+#[test]
+fn version_and_help_are_successful_outputs() {
+    let version = text(run(vec!["ocrouter".to_string(), "--version".to_string()]).unwrap());
+    assert!(version.contains("ocrouter"), "{version}");
+
+    let help = text(run(vec!["ocrouter".to_string(), "--help".to_string()]).unwrap());
+    assert!(help.contains("serve"), "{help}");
+}
