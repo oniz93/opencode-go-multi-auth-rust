@@ -31,11 +31,20 @@ No linter or formatter config exists beyond rustfmt defaults.
 ```
 crates/core   ocrouter-core — config, keys, router, quota, models. No HTTP, no UI.
 crates/cli    ocrouter-cli  — lib (engine, control_api, proxy_server, cli) + bin `ocrouter`.
+crates/gui    ocrouter-gui  — GPUI dashboard. A control-API client + `.app` bundle.
 ```
 
-`crates/core` must never depend on HTTP-server or UI crates. The GPUI dashboard
-is a separate crate (not yet written) and must never be a dependency of
-`ocrouter-cli`.
+`crates/core` must never depend on HTTP-server or UI crates. `crates/gui` must
+never be a dependency of `ocrouter-cli`; it only talks to the control API over
+HTTP. The GUI polls on a std thread because gpui's executor is not tokio.
+
+The macOS bundle is assembled by `scripts/bundle-macos.sh` into
+`dist/Ocrouter.app` (gitignored). It contains both binaries; the GUI starts the
+sibling `ocrouter serve` when `18904/healthz` does not answer.
+
+Toolchain note: `gpui-pre` needs a stable rustc with `slice_as_array` (1.98+),
+so `crates/gui` declares `rust-version = "1.98"` while the daemon still builds
+on 1.91.
 
 ## Invariants — do not regress
 

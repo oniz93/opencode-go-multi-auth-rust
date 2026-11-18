@@ -1,6 +1,9 @@
 # Rust build output
 /target
 
+# packaged app
+/dist
+
 # Local runtime state (never commit)
 *.log
 .env

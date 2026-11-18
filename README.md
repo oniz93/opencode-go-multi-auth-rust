@@ -19,6 +19,17 @@ cargo build --release
 # binary: target/aarch64-apple-darwin/release/ocrouter
 ```
 
+### macOS app (dashboard + auto-start)
+
+```bash
+./scripts/bundle-macos.sh     # -> dist/Ocrouter.app
+open dist/Ocrouter.app
+```
+
+`Ocrouter.app` opens the native GPUI dashboard and starts the background
+daemon if `127.0.0.1:18904/healthz` is not already answering. Closing the
+window does not stop the daemon.
+
 `.cargo/config.toml` pins the native `aarch64-apple-darwin` target so a
 Rosetta binary is never produced.
 
