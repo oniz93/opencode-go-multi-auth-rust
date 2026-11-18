@@ -1,0 +1,18 @@
+# Rust build output
+/target
+
+# Local runtime state (never commit)
+*.log
+.env
+*.enc
+keys.toml
+control.token
+state.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Agent scratch
+.superpowers/
