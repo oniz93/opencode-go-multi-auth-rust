@@ -9,10 +9,10 @@ TARGET=aarch64-apple-darwin
 APP="dist/Ocrouter.app"
 BIN_DIR="target/$TARGET/release"
 
-echo "building release binaries…"
+echo "building release binaries..."
 cargo build --release -p ocrouter-cli -p ocrouter-gui
 
-echo "assembling $APP…"
+echo "assembling ${APP}..."
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
