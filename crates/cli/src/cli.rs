@@ -284,39 +284,48 @@ pub fn run(args: Vec<String>) -> anyhow::Result<RunOutcome> {
     }
 }
 
+/// Fetch every lane's model list. Zen is fetched only when a Zen key exists,
+/// so its models are never listed without a way to call them.
+pub async fn build_catalog(config: &Config, keys: &KeyFile) -> ocrouter_core::models::Catalog {
+    use ocrouter_core::models::fetch_models;
+    let client = reqwest::Client::new();
+    let secret = |provider: Provider| {
+        keys.key
+            .iter()
+            .find(|k| k.provider == provider)
+            .map(|k| k.secret.clone())
+    };
+    let fetch = |provider: Provider, secret: Option<String>| {
+        let upstream = ocrouter_core::provider::upstream_for(provider, config);
+        let client = client.clone();
+        async move {
+            fetch_models(&client, &upstream, secret.as_deref())
+                .await
+                .unwrap_or_default()
+        }
+    };
+
+    let go = fetch(Provider::OpenCodeGo, secret(Provider::OpenCodeGo)).await;
+    let el = fetch(Provider::Experiential, secret(Provider::Experiential)).await;
+    // Zen's list is public and answers 401 to a bad key, so ask without one.
+    let zen = if secret(Provider::OpenCodeConsole).is_some() {
+        fetch(Provider::OpenCodeConsole, None).await
+    } else {
+        Vec::new()
+    };
+
+    if go.is_empty() && el.is_empty() && zen.is_empty() {
+        eprintln!("warning: could not fetch any model catalog; add a key or check connectivity");
+    }
+    ocrouter_core::models::Catalog::merged(go, el).with_console(zen)
+}
+
 fn sync_models(config_path: &Path, keys_path: &Path, write: bool) -> anyhow::Result<RunOutcome> {
     let config = Config::load(config_path)?;
     let keys = KeyFile::load(keys_path)?;
     let runtime = tokio::runtime::Runtime::new()?;
 
-    let secret = keys
-        .key
-        .iter()
-        .find(|k| k.provider == Provider::OpenCodeGo)
-        .map(|k| k.secret.clone());
-
-    let client = reqwest::Client::new();
-    let go_upstream = ocrouter_core::provider::upstream_for(Provider::OpenCodeGo, &config);
-    let el_upstream = ocrouter_core::provider::upstream_for(Provider::Experiential, &config);
-
-    let (go, el) = runtime.block_on(async {
-        let go = ocrouter_core::models::fetch_models(&client, &go_upstream, secret.as_deref())
-            .await
-            .unwrap_or_default();
-        let el = ocrouter_core::models::fetch_models(
-            &client,
-            &el_upstream,
-            keys.key
-                .iter()
-                .find(|k| k.provider == Provider::Experiential)
-                .map(|k| k.secret.as_str()),
-        )
-        .await
-        .unwrap_or_default();
-        (go, el)
-    });
-
-    let catalog = ocrouter_core::models::Catalog::merged(go, el);
+    let catalog = runtime.block_on(build_catalog(&config, &keys));
     let base = format!("http://127.0.0.1:{}/v1", config.proxy_port);
     let models = config.routing.exposed(&catalog.models);
     let snippet = ocrouter_core::models::opencode::generate_snippet(&models, &base);

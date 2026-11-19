@@ -28,6 +28,18 @@ impl Catalog {
         }
     }
 
+    /// Add Zen (Console) models. They only fill ids Go and Experiential do not
+    /// serve, so a shared id keeps routing to those lanes.
+    pub fn with_console(mut self, console: Vec<ModelInfo>) -> Catalog {
+        for model in console {
+            if self.get(&model.id).is_none() {
+                self.models.push(model);
+            }
+        }
+        self.models.sort_by(|a, b| a.id.cmp(&b.id));
+        self
+    }
+
     pub fn lane_for(&self, model_id: &str) -> Option<Lane> {
         self.models
             .iter()

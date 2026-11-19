@@ -1,11 +1,10 @@
-use ocrouter_cli::cli::{default_paths, load_or_create_control_token, run, RunOutcome};
+use ocrouter_cli::cli::{build_catalog, default_paths, load_or_create_control_token, run, RunOutcome};
 use ocrouter_cli::control_api::{AppState, ControlApi};
 use ocrouter_cli::engine::Engine;
 use ocrouter_cli::proxy_server::ProxyServer;
 use ocrouter_core::config::Config;
 use ocrouter_core::keys::KeyFile;
-use ocrouter_core::models::{fetch_models, Catalog};
-use ocrouter_core::provider::{upstream_for, Provider};
+use ocrouter_core::provider::Provider;
 use ocrouter_core::router::types::ApiKey;
 use ocrouter_core::state::StateStore;
 
@@ -19,35 +18,6 @@ async fn main() -> anyhow::Result<()> {
         }
         RunOutcome::Serve => serve().await,
     }
-}
-
-async fn build_catalog(config: &Config, keys: &KeyFile) -> Catalog {
-    let client = reqwest::Client::new();
-    let go_secret = keys
-        .key
-        .iter()
-        .find(|k| k.provider == Provider::OpenCodeGo)
-        .map(|k| k.secret.clone());
-    let el_secret = keys
-        .key
-        .iter()
-        .find(|k| k.provider == Provider::Experiential)
-        .map(|k| k.secret.clone());
-
-    let go_upstream = upstream_for(Provider::OpenCodeGo, config);
-    let el_upstream = upstream_for(Provider::Experiential, config);
-
-    let go = fetch_models(&client, &go_upstream, go_secret.as_deref())
-        .await
-        .unwrap_or_default();
-    let el = fetch_models(&client, &el_upstream, el_secret.as_deref())
-        .await
-        .unwrap_or_default();
-
-    if go.is_empty() && el.is_empty() {
-        eprintln!("warning: could not fetch any model catalog; add a key or check connectivity");
-    }
-    Catalog::merged(go, el)
 }
 
 async fn resolve_el_org(config: &Config, secret: &str) -> Option<String> {
