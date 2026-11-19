@@ -31,6 +31,7 @@ enum Command {
     /// Run the proxy and control API
     Serve,
     /// Manage pooled API keys
+    #[command(alias = "keys")]
     Key {
         #[command(subcommand)]
         action: KeyAction,
@@ -323,9 +324,16 @@ pub async fn build_catalog(config: &Config, keys: &KeyFile) -> ocrouter_core::mo
 fn sync_models(config_path: &Path, keys_path: &Path, write: bool) -> anyhow::Result<RunOutcome> {
     let config = Config::load(config_path)?;
     let keys = KeyFile::load(keys_path)?;
-    let runtime = tokio::runtime::Runtime::new()?;
 
-    let catalog = runtime.block_on(build_catalog(&config, &keys));
+    // `run` executes inside the binary's tokio runtime, which may not block or
+    // drop a nested one, so the fetch gets its own thread and runtime.
+    let catalog = std::thread::scope(|s| {
+        s.spawn(|| -> anyhow::Result<_> {
+            Ok(tokio::runtime::Runtime::new()?.block_on(build_catalog(&config, &keys)))
+        })
+        .join()
+    })
+    .map_err(|_| anyhow::anyhow!("model fetch thread panicked"))??;
     let base = format!("http://127.0.0.1:{}/v1", config.proxy_port);
     let models = config.routing.exposed(&catalog.models);
     let snippet = ocrouter_core::models::opencode::generate_snippet(&models, &base);

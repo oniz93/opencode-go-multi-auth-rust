@@ -119,3 +119,22 @@ fn control_tokens_are_long_and_unpredictable() {
     assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     assert_ne!(a, b);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn models_sync_runs_inside_the_binarys_runtime() {
+    // `main` is `#[tokio::main]`; sync must not start or drop a nested runtime there.
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "go_base_url = \"http://127.0.0.1:9\"\nel_base_url = \"http://127.0.0.1:9\"\n",
+    )
+    .unwrap();
+    let keys = dir.path().join("keys.toml");
+    let mut args = arg_list(keys.to_str().unwrap(), &["keys", "list"]);
+    run(args.clone()).unwrap();
+    args.truncate(3);
+    args.extend(["--config", config.to_str().unwrap(), "models", "sync"].map(String::from));
+    let out = tokio::task::block_in_place(|| run(args)).unwrap();
+    assert!(text(out).contains("ocrouter"));
+}
