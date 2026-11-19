@@ -44,10 +44,11 @@ impl UpstreamClient for FakeUpstream {
             calls.len() - 1
         };
         let scripted = self.scripted.lock().unwrap();
-        let (status, content_type, body) = scripted
-            .get(index)
-            .cloned()
-            .unwrap_or((200, None, "{}".to_string()));
+        let (status, content_type, body) =
+            scripted
+                .get(index)
+                .cloned()
+                .unwrap_or((200, None, "{}".to_string()));
         let mut headers = HeaderMap::new();
         if let Some(content_type) = content_type {
             headers.insert("content-type", content_type.parse().unwrap());
@@ -123,12 +124,16 @@ fn post(path: &str, body: &str) -> IncomingRequest {
     }
 }
 
-const SHARED_BODY: &str = r#"{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}"#;
+const SHARED_BODY: &str =
+    r#"{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}"#;
 
 #[tokio::test]
 async fn el_quota_falls_over_to_go_with_the_same_body() {
     let fake = FakeUpstream::new(vec![
-        (429, r#"{"error":{"code":"free_limit_reached"}}"#.to_string()),
+        (
+            429,
+            r#"{"error":{"code":"free_limit_reached"}}"#.to_string(),
+        ),
         (200, "{}".to_string()),
     ]);
     let mut engine = engine(true, 1);
@@ -140,9 +145,20 @@ async fn el_quota_falls_over_to_go_with_the_same_body() {
 
     let calls = fake.calls();
     assert_eq!(calls.len(), 2, "expected one EL try then one Go try");
-    assert!(calls[0].url.contains("experientiallabs"), "got {}", calls[0].url);
-    assert!(calls[1].url.contains("opencode.ai/inference/go"), "got {}", calls[1].url);
-    assert_eq!(calls[0].body, calls[1].body, "the body must be forwarded unmodified");
+    assert!(
+        calls[0].url.contains("experientiallabs"),
+        "got {}",
+        calls[0].url
+    );
+    assert!(
+        calls[1].url.contains("opencode.ai/inference/go"),
+        "got {}",
+        calls[1].url
+    );
+    assert_eq!(
+        calls[0].body, calls[1].body,
+        "the body must be forwarded unmodified"
+    );
     assert_eq!(out.status, 200);
 }
 
@@ -183,7 +199,11 @@ async fn an_exhausted_el_budget_routes_straight_to_go() {
 
     let calls = fake.calls();
     assert_eq!(calls.len(), 1);
-    assert!(calls[0].url.contains("opencode.ai/inference/go"), "got {}", calls[0].url);
+    assert!(
+        calls[0].url.contains("opencode.ai/inference/go"),
+        "got {}",
+        calls[0].url
+    );
 }
 
 #[tokio::test]
@@ -191,10 +211,7 @@ async fn a_repeated_5xx_across_two_keys_counts_against_only_one_breaker() {
     let mut config = Config::default();
     config.circuit_breaker_threshold = 1;
     let mut engine = Engine::new(config, &keyfile(false, 2), shared_catalog());
-    let fake = FakeUpstream::new(vec![
-        (500, "boom".to_string()),
-        (500, "boom".to_string()),
-    ]);
+    let fake = FakeUpstream::new(vec![(500, "boom".to_string()), (500, "boom".to_string())]);
 
     let _ = engine
         .handle(post("/go/v1/chat/completions", SHARED_BODY), &fake, 0)
@@ -242,8 +259,7 @@ async fn drain(body: ocrouter_cli::body::ProxyBody) -> Vec<u8> {
     }
 }
 
-const USAGE_SSE: &str =
-    "data: {\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":100}}\n\n";
+const USAGE_SSE: &str = "data: {\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":100}}\n\n";
 
 #[tokio::test]
 async fn streamed_go_usage_does_not_touch_the_el_budget() {
@@ -342,4 +358,88 @@ async fn an_unresolved_org_falls_back_instead_of_disabling_el() {
         fake.calls()[0].url.contains("experientiallabs"),
         "an unknown org must not silently switch the product to Go-only"
     );
+}
+
+#[tokio::test]
+async fn a_route_walks_its_steps_on_429_and_skips_cooled_keys_next_time() {
+    let mut kf = keyfile(true, 1);
+    kf.add(KeyEntry {
+        provider: Provider::OpenCodeConsole,
+        label: "zen-1".to_string(),
+        secret: "zen_secret".to_string(),
+        priority: 1,
+        weight: 1,
+        enabled: true,
+    });
+    let mut config = Config::default();
+    config.routing.route.push(ocrouter_core::config::Route {
+        model: "ds".to_string(),
+        steps: [
+            ("opencode-console:zen-1", "deepseek-v4.1-flash-free"),
+            ("experiential:el-1", "deepseek-v4.1-flash-1017"),
+            ("opencode-go:go-0", "deepseek-v4.1-flash"),
+        ]
+        .into_iter()
+        .map(|(key, model)| ocrouter_core::config::RouteStep {
+            key: key.to_string(),
+            model: model.to_string(),
+        })
+        .collect(),
+    });
+    let mut engine = Engine::new(config, &kf, shared_catalog());
+    engine.set_el_org(Some("org-1".to_string()));
+    // A plain rate limit (no quota marker) still moves a route on.
+    let fake = FakeUpstream::new(vec![
+        (429, r#"{"error":"rate limited"}"#.to_string()),
+        (200, "{}".to_string()),
+    ]);
+    let body = r#"{"model":"ds","messages":[]}"#;
+
+    let out = engine
+        .handle(post("/v1/chat/completions", body), &fake, 0)
+        .await;
+    assert_eq!(out.status, 200);
+    let calls = fake.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls[0].url.starts_with("https://opencode.ai/inference/v1"),
+        "{}",
+        calls[0].url
+    );
+    assert!(String::from_utf8_lossy(&calls[0].body).contains("deepseek-v4.1-flash-free"));
+    assert!(
+        calls[1].url.contains("experientiallabs"),
+        "{}",
+        calls[1].url
+    );
+    assert!(String::from_utf8_lossy(&calls[1].body).contains("deepseek-v4.1-flash-1017"));
+
+    // Zen is cooling and the EL org's allowance is spent: go straight to Go.
+    engine.record_el_usage("org-1", 1_000_000, 0);
+    let fake = FakeUpstream::new(vec![(200, "{}".to_string())]);
+    let _ = engine
+        .handle(post("/v1/chat/completions", body), &fake, 1_000)
+        .await;
+    let calls = fake.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].url.contains("opencode.ai/inference/go"),
+        "{}",
+        calls[0].url
+    );
+    assert!(String::from_utf8_lossy(&calls[0].body).contains(r#""model":"deepseek-v4.1-flash""#));
+
+    // Only exposed ids are listed; the route alias is listed even though no upstream has it.
+    engine.shared().routing.lock().unwrap().expose = vec!["ds".to_string()];
+    let get = IncomingRequest {
+        method: "GET".to_string(),
+        ..post("/v1/models", "")
+    };
+    let out = engine.handle(get, &fake, 2_000).await;
+    let listed = match out.body {
+        ProxyBody::Bytes(bytes) => String::from_utf8(bytes).unwrap(),
+        _ => panic!("models list is not streamed"),
+    };
+    assert!(listed.contains(r#""id":"ds""#), "{listed}");
+    assert!(!listed.contains("kimi-k3"), "{listed}");
 }

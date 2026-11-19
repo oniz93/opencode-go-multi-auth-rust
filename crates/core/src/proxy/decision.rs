@@ -66,6 +66,8 @@ pub struct ResponseSignal<'a> {
     /// `false` when this same body already produced a 5xx on another key, so a
     /// bad request cannot evict every healthy key.
     pub count_breaker_failure: bool,
+    /// Route chains move on at any 429, not just a recognised quota wall.
+    pub advance_on_429: bool,
 }
 
 pub fn classify(
@@ -74,15 +76,16 @@ pub fn classify(
     keys: &mut KeyManager,
     allowance: &mut Allowance,
 ) -> Attempt {
-    if signal.status == 402
-        || (signal.status == 429 && is_quota_error(signal.status, signal.headers, signal.body_peek))
-    {
-        let cooldown = resolve_cooldown_ms(
-            signal.headers,
-            signal.body_peek,
-            signal.now_ms,
-            signal.fallback_cooldown_ms,
-        );
+    let quota = is_quota_error(signal.status, signal.headers, signal.body_peek);
+    if quota || (signal.status == 429 && signal.advance_on_429) {
+        // shortcut: a plain rate limit with no reset hint parks the key for 60s; make it configurable if that proves wrong.
+        let fallback = if quota {
+            signal.fallback_cooldown_ms
+        } else {
+            60_000
+        };
+        let cooldown =
+            resolve_cooldown_ms(signal.headers, signal.body_peek, signal.now_ms, fallback);
         keys.mark_exhausted(signal.key_id, signal.now_ms.saturating_add(cooldown));
         return Attempt::Retry;
     }

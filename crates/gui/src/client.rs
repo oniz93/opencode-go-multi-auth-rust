@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::state::{parse_status, UiState};
+use crate::state::{parse_models, parse_routing, parse_status, UiState};
 
 pub const CONTROL_PORT: u16 = 18904;
 
@@ -63,11 +63,7 @@ pub fn ensure_daemon(bin: &Path, port: u16) -> bool {
     false
 }
 
-pub fn poll_once(
-    client: &reqwest::blocking::Client,
-    base: &str,
-    token: Option<&str>,
-) -> UiState {
+pub fn poll_once(client: &reqwest::blocking::Client, base: &str, token: Option<&str>) -> UiState {
     let get = |path: &str| -> Option<String> {
         let mut request = client.get(format!("{base}{path}"));
         if let Some(token) = token {
@@ -87,7 +83,40 @@ pub fn poll_once(
         };
     };
     let keys = get("/api/keys").unwrap_or_else(|| "[]".to_string());
-    parse_status(&status, &keys)
+    let mut state = parse_status(&status, &keys);
+    state.routing = parse_routing(&get("/api/routing").unwrap_or_default());
+    state.models = parse_models(&get("/api/models").unwrap_or_default());
+    state
+}
+
+/// One blocking control-API write. Call it off the UI thread.
+pub fn call(
+    base: &str,
+    token: Option<&str>,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<String>,
+) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut request = client.request(method, format!("{base}{path}"));
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    if let Some(body) = body {
+        request = request
+            .header("content-type", "application/json")
+            .body(body);
+    }
+    let response = request.send().map_err(|e| e.to_string())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let status = response.status();
+        Err(format!("{status}: {}", response.text().unwrap_or_default()))
+    }
 }
 
 pub fn spawn_poller(state: Arc<Mutex<UiState>>, base: String, token: Option<String>) {

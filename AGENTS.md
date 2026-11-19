@@ -48,9 +48,13 @@ on 1.91.
 
 ## Invariants — do not regress
 
-- **Byte-for-byte bodies.** The only permitted mutation is
+- **Byte-for-byte bodies.** The only permitted mutations are
   `stream_options.include_usage = true` on streamed chat-completions
-  (`engine::prepare_body`). Model ids are never rewritten.
+  (`engine::prepare_body`) and, for a `[[routing.route]]` step, `model` set to
+  that step's upstream id (`engine::with_model`). Nothing else rewrites ids.
+- **Routes** (`config.toml` `[routing]`, edited in the GUI) walk their steps in
+  order; any 429/402 cools that key and moves on. Cooled keys and a spent EL
+  org allowance are skipped without a request. `expose` filters `/v1/models`.
 - **Route on path and `model` only.** Never read `tools` / `messages` /
   `tool_use`.
 - **Go requires `x-opencode-session`.** Synthesise it when the client omits it

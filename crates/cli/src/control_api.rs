@@ -5,13 +5,16 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
+use std::path::PathBuf;
+
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use ocrouter_core::keys::mask_secret;
+use ocrouter_core::config::{Config, Routing};
+use ocrouter_core::keys::{mask_secret, KeyEntry, KeyFile};
 use ocrouter_core::models::opencode::generate_snippet;
 use ocrouter_core::provider::Provider;
 use ocrouter_core::router::types::{ApiKey, KeyStatus, RoutingStrategy};
@@ -22,6 +25,9 @@ use crate::engine::Shared;
 pub struct AppState {
     pub shared: Shared,
     pub token: String,
+    /// Where key and routing edits are persisted. `None` keeps them in memory (tests).
+    pub keys_path: Option<PathBuf>,
+    pub config_path: Option<PathBuf>,
 }
 
 pub struct ControlApi {
@@ -48,6 +54,7 @@ impl ControlApi {
             .route("/status", get(status))
             .route("/models", get(list_models))
             .route("/models/opencode-snippet", get(snippet))
+            .route("/routing", get(get_routing).put(put_routing))
             .route("/strategy", get(get_strategy).put(put_strategy))
             .route("/events", get(sse_events))
             .layer(middleware::from_fn_with_state(state.clone(), require_token));
@@ -122,10 +129,48 @@ struct AddKeyRequest {
     weight: u32,
 }
 
-async fn add_key(
-    State(state): State<AppState>,
-    Json(body): Json<AddKeyRequest>,
-) -> Json<Value> {
+fn internal(error: anyhow::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": error.to_string() })),
+    )
+        .into_response()
+}
+
+fn edit_keyfile(state: &AppState, edit: impl FnOnce(&mut KeyFile)) -> anyhow::Result<()> {
+    let Some(path) = state.keys_path.as_deref() else {
+        return Ok(());
+    };
+    let mut kf = KeyFile::load(path)?;
+    edit(&mut kf);
+    kf.save(path)
+}
+
+async fn add_key(State(state): State<AppState>, Json(body): Json<AddKeyRequest>) -> Response {
+    if body.secret.trim().is_empty() || body.label.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "label and secret are required" })),
+        )
+            .into_response();
+    }
+    let entry = KeyEntry {
+        provider: body.provider,
+        label: body.label.trim().to_string(),
+        secret: body.secret.trim().to_string(),
+        priority: body.priority,
+        weight: body.weight,
+        enabled: true,
+    };
+    let saved = edit_keyfile(&state, |kf| {
+        kf.key
+            .retain(|k| !(k.provider == entry.provider && k.label == entry.label));
+        kf.add(entry.clone());
+    });
+    if let Err(error) = saved {
+        return internal(error);
+    }
+    let body = entry;
     let id = ApiKey::new_id(body.provider, &body.label);
     let key = ApiKey {
         id: id.clone(),
@@ -141,26 +186,46 @@ async fn add_key(
     };
     let preview = mask_secret(&key.secret);
     state.shared.keys.lock().expect("keys poisoned").add(key);
-    Json(json!({ "id": id, "preview": preview }))
+    Json(json!({ "id": id, "preview": preview })).into_response()
 }
 
 async fn remove_key(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let removed = state.shared.keys.lock().expect("keys poisoned").remove(&id);
     if removed {
+        if let Err(error) = edit_keyfile(&state, |kf| {
+            kf.key
+                .retain(|k| ApiKey::new_id(k.provider, &k.label) != id)
+        }) {
+            return internal(error);
+        }
         Json(json!({ "removed": id })).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "key not found" }))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "key not found" })),
+        )
+            .into_response()
     }
 }
 
 async fn test_key(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let present = state.shared.keys.lock().expect("keys poisoned").get(&id).is_some();
+    let present = state
+        .shared
+        .keys
+        .lock()
+        .expect("keys poisoned")
+        .get(&id)
+        .is_some();
     if present {
         // A live probe needs the upstream; the CLI/GUI runs it. Here we report
         // that the key exists and is selectable.
         Json(json!({ "id": id, "present": true })).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "key not found" }))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "key not found" })),
+        )
+            .into_response()
     }
 }
 
@@ -202,9 +267,53 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn snippet(State(state): State<AppState>) -> Json<Value> {
-    let catalog = state.shared.catalog.as_ref();
+    let models = state
+        .shared
+        .routing
+        .lock()
+        .map(|r| r.exposed(&state.shared.catalog.models))
+        .unwrap_or_default();
     let base = format!("http://127.0.0.1:{}/v1", state.shared.config.proxy_port);
-    Json(generate_snippet(&catalog.models, &base))
+    Json(generate_snippet(&models, &base))
+}
+
+async fn get_routing(State(state): State<AppState>) -> Json<Value> {
+    let routing = state
+        .shared
+        .routing
+        .lock()
+        .map(|r| r.clone())
+        .unwrap_or_default();
+    Json(json!(routing))
+}
+
+async fn put_routing(State(state): State<AppState>, Json(body): Json<Routing>) -> Response {
+    let blank = body.route.iter().any(|r| {
+        r.model.trim().is_empty()
+            || r.steps
+                .iter()
+                .any(|s| s.key.trim().is_empty() || s.model.trim().is_empty())
+    });
+    if blank {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "route model, step key and step model are required" })),
+        )
+            .into_response();
+    }
+    if let Some(path) = state.config_path.as_deref() {
+        let saved = Config::read(path).and_then(|mut cfg| {
+            cfg.routing = body.clone();
+            cfg.save(path)
+        });
+        if let Err(error) = saved {
+            return internal(error);
+        }
+    }
+    if let Ok(mut routing) = state.shared.routing.lock() {
+        *routing = body.clone();
+    }
+    Json(json!(body)).into_response()
 }
 
 async fn get_strategy(State(state): State<AppState>) -> Json<Value> {

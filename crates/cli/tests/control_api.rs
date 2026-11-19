@@ -17,6 +17,14 @@ use ocrouter_core::router::key_manager::KeyManager;
 use ocrouter_core::router::session_affinity::SessionAffinity;
 
 fn app_with(secret: Option<&str>) -> (axum::Router, String) {
+    app_at(secret, None, None)
+}
+
+fn app_at(
+    secret: Option<&str>,
+    keys_path: Option<std::path::PathBuf>,
+    config_path: Option<std::path::PathBuf>,
+) -> (axum::Router, String) {
     let token = "test-token".to_string();
     let mut kf = KeyFile::default();
     if let Some(secret) = secret {
@@ -42,12 +50,15 @@ fn app_with(secret: Option<&str>) -> (axum::Router, String) {
         events: EventBus::new(64),
         affinity: Arc::new(Mutex::new(SessionAffinity::new())),
         strategy: Arc::new(Mutex::new(config.strategy)),
+        routing: Arc::new(Mutex::new(config.routing.clone())),
     };
     (
         ControlApi::new(
             AppState {
                 shared,
                 token: String::new(),
+                keys_path,
+                config_path,
             },
             token.clone(),
         )
@@ -81,7 +92,10 @@ async fn send(
 #[tokio::test]
 async fn api_requires_the_token() {
     let (app, token) = app_with(Some("oc_VERYSECRET1234"));
-    assert_eq!(send(&app, "GET", "/api/keys", None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, "GET", "/api/keys", None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         send(&app, "GET", "/api/keys", Some("Bearer wrong")).await.0,
         StatusCode::UNAUTHORIZED
@@ -142,4 +156,86 @@ async fn status_reports_key_counts() {
     let (status, body) = send(&app, "GET", "/api/status", Some(&format!("Bearer {token}"))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("\"keys\""));
+}
+
+async fn send_json(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    auth: &str,
+    body: &str,
+) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("authorization", auth)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body).to_string())
+}
+
+#[tokio::test]
+async fn keys_and_routing_edits_are_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys_path = dir.path().join("keys.toml");
+    let config_path = dir.path().join("config.toml");
+    let (app, token) = app_at(None, Some(keys_path.clone()), Some(config_path.clone()));
+    let auth = format!("Bearer {token}");
+
+    let (status, body) = send_json(
+        &app,
+        "POST",
+        "/api/keys",
+        &auth,
+        r#"{"provider":"opencode-console","label":"zen-1","secret":"sk_ZENSECRET99"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("ZENSECRET"), "leaked: {body}");
+    assert_eq!(KeyFile::load(&keys_path).unwrap().key.len(), 1);
+
+    let routing = r#"{"expose":["ds"],"route":[{"model":"ds","steps":[
+        {"key":"opencode-console:zen-1","model":"deepseek-v4.1-flash-free"}]}]}"#;
+    let (status, _) = send_json(&app, "PUT", "/api/routing", &auth, routing).await;
+    assert_eq!(status, StatusCode::OK);
+    let saved = Config::read(&config_path).unwrap();
+    assert_eq!(saved.routing.expose, vec!["ds".to_string()]);
+    assert_eq!(
+        saved.routing.route[0].steps[0].model,
+        "deepseek-v4.1-flash-free"
+    );
+
+    let (_, body) = send(&app, "GET", "/api/routing", Some(&auth)).await;
+    assert!(body.contains("opencode-console:zen-1"), "{body}");
+
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        "/api/keys/opencode-console:zen-1",
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(KeyFile::load(&keys_path).unwrap().key.is_empty());
+
+    let (status, _) = send_json(
+        &app,
+        "PUT",
+        "/api/routing",
+        &auth,
+        r#"{"route":[{"model":"","steps":[]}]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

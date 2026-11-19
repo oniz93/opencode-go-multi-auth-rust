@@ -3,12 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
 use http::HeaderMap;
-use ocrouter_core::config::Config;
+use ocrouter_core::config::{Config, Routing};
 use ocrouter_core::events::{EventBus, EventRecord, Level};
 use ocrouter_core::keys::KeyFile;
 use ocrouter_core::models::{Catalog, Lane};
 use ocrouter_core::provider::{upstream_for, Provider};
-use ocrouter_core::proxy::decision::{classify, choose_lane, Attempt, LaneChoice, ResponseSignal};
+use ocrouter_core::proxy::decision::{choose_lane, classify, Attempt, LaneChoice, ResponseSignal};
 use ocrouter_core::proxy::headers::{build_upstream_headers, generate_session_id};
 use ocrouter_core::proxy::routing::{build_upstream_url, strip_lane_prefix};
 use ocrouter_core::proxy::usage::{parse_usage, parse_usage_from_sse, ApiShape};
@@ -69,6 +69,24 @@ pub struct Shared {
     pub events: EventBus,
     pub affinity: Arc<Mutex<SessionAffinity>>,
     pub strategy: Arc<Mutex<RoutingStrategy>>,
+    pub routing: Arc<Mutex<Routing>>,
+}
+
+/// One upstream to try. A route step pins a key and the model id to send.
+struct Target {
+    provider: Provider,
+    key: Option<String>,
+    model: Option<String>,
+}
+
+impl Target {
+    fn lane(provider: Provider) -> Self {
+        Target {
+            provider,
+            key: None,
+            model: None,
+        }
+    }
 }
 
 pub struct Engine {
@@ -99,7 +117,25 @@ fn shape_for(path: &str) -> ApiShape {
 
 fn extract_model(body: &[u8]) -> Option<String> {
     let json: serde_json::Value = serde_json::from_slice(body).ok()?;
-    json.get("model").and_then(|m| m.as_str()).map(str::to_string)
+    json.get("model")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+}
+
+/// Route steps may name the model differently per upstream (EL's
+/// `deepseek-v4.1-flash-1017` is Go's `deepseek-v4.1-flash`); only then is
+/// `model` rewritten.
+fn with_model(body: &[u8], model: &str) -> Vec<u8> {
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+    if json.get("model").and_then(|m| m.as_str()) == Some(model) {
+        return body.to_vec();
+    }
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("model".to_string(), serde_json::Value::from(model));
+    }
+    serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec())
 }
 
 fn is_event_stream(headers: &HeaderMap) -> bool {
@@ -129,7 +165,10 @@ fn prepare_body(body: &[u8], path: &str) -> Vec<u8> {
         .unwrap_or_default();
     options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
     if let Some(obj) = json.as_object_mut() {
-        obj.insert("stream_options".to_string(), serde_json::Value::Object(options));
+        obj.insert(
+            "stream_options".to_string(),
+            serde_json::Value::Object(options),
+        );
     }
     serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec())
 }
@@ -200,6 +239,7 @@ impl Engine {
         let breaker = CircuitBreaker::new(config.circuit_breaker_threshold, config.cooldown_ms);
         let allowance = Allowance::new(config.el_daily_token_cap, config.el_safety_margin);
         let strategy = config.strategy;
+        let routing = config.routing.clone();
         Engine {
             shared: Shared {
                 config: Arc::new(config),
@@ -210,6 +250,7 @@ impl Engine {
                 events: EventBus::new(512),
                 affinity: Arc::new(Mutex::new(SessionAffinity::new())),
                 strategy: Arc::new(Mutex::new(strategy)),
+                routing: Arc::new(Mutex::new(routing)),
             },
             el_org: None,
         }
@@ -265,7 +306,10 @@ impl Engine {
             return session.to_string();
         }
         if provider == Provider::OpenCodeGo {
-            if let Some(cache_key) = headers.get("prompt-cache-key").and_then(|v| v.to_str().ok()) {
+            if let Some(cache_key) = headers
+                .get("prompt-cache-key")
+                .and_then(|v| v.to_str().ok())
+            {
                 if !cache_key.is_empty() {
                     return format!("ses_{cache_key}");
                 }
@@ -274,7 +318,34 @@ impl Engine {
         generate_session_id()
     }
 
-    fn targets(&self, explicit: Option<Lane>, model: Option<&str>) -> Vec<Provider> {
+    fn targets(&self, explicit: Option<Lane>, model: Option<&str>) -> Vec<Target> {
+        if explicit.is_none() {
+            if let Some(route) = model.and_then(|m| {
+                let routing = self.shared.routing.lock().ok()?;
+                routing.route_for(m).cloned()
+            }) {
+                let keys = self.shared.keys.lock().expect("keys poisoned");
+                return route
+                    .steps
+                    .into_iter()
+                    .filter_map(|step| {
+                        let provider = keys.get(&step.key)?.provider;
+                        Some(Target {
+                            provider,
+                            key: Some(step.key),
+                            model: Some(step.model),
+                        })
+                    })
+                    .collect();
+            }
+        }
+        self.lane_targets(explicit, model)
+            .into_iter()
+            .map(Target::lane)
+            .collect()
+    }
+
+    fn lane_targets(&self, explicit: Option<Lane>, model: Option<&str>) -> Vec<Provider> {
         match explicit {
             Some(Lane::Go) => vec![Provider::OpenCodeGo],
             Some(Lane::Console) => vec![Provider::OpenCodeConsole],
@@ -330,10 +401,13 @@ impl Engine {
         }
 
         if incoming.method.eq_ignore_ascii_case("GET") && forward_path.ends_with("/models") {
-            let data: Vec<serde_json::Value> = self
+            let exposed = self
                 .shared
-                .catalog
-                .models
+                .routing
+                .lock()
+                .map(|r| r.exposed(&self.shared.catalog.models))
+                .unwrap_or_default();
+            let data: Vec<serde_json::Value> = exposed
                 .iter()
                 .map(|m| {
                     serde_json::json!({
@@ -377,9 +451,14 @@ impl Engine {
         let mut body_5xx_seen = false;
         let mut last: Option<ProxyOutcome> = None;
 
-        for provider in targets {
+        for target in targets {
+            let provider = target.provider;
             let upstream = upstream_for(provider, &self.shared.config);
             let host = host_of(&upstream.base_url);
+            let body = match target.model.as_deref() {
+                Some(model) => with_model(&body, model),
+                None => body.clone(),
+            };
             let available = self
                 .shared
                 .keys
@@ -392,42 +471,70 @@ impl Engine {
                 })
                 .unwrap_or(0);
             let mut excluded: HashSet<String> = HashSet::new();
+            let tries = if target.key.is_some() {
+                1
+            } else {
+                available.max(1)
+            };
 
-            for _ in 0..available.max(1) {
-                let sticky = client_session.as_deref().and_then(|session| {
-                    let affinity = self.shared.affinity.lock().ok()?;
-                    let preferred = affinity.preferred(session)?;
-                    if excluded.contains(&preferred) {
-                        return None;
-                    }
+            for _ in 0..tries {
+                // Check what is known before calling: a cooled key, or a spent
+                // Experiential org allowance, is skipped without a request.
+                let pinned = target.key.as_deref().map(|id| {
+                    let el_spent = provider == Provider::Experiential
+                        && !self.shared.config.el_allow_paid
+                        && self.el_org.as_deref().is_some_and(|org| {
+                            self.shared
+                                .allowance
+                                .lock()
+                                .map(|a| a.is_exhausted(org))
+                                .unwrap_or(false)
+                        });
                     let keys = self.shared.keys.lock().ok()?;
-                    let key = keys.get(&preferred)?;
-                    if key.provider == provider && key.enabled {
-                        Some(ocrouter_core::router::types::KeySelection {
-                            key: key.clone(),
-                            reason: format!("sticky session reused {preferred}"),
-                        })
-                    } else {
-                        None
-                    }
+                    let key = keys
+                        .eligible(&excluded, now_ms)
+                        .into_iter()
+                        .find(|k| k.id == id)?
+                        .clone();
+                    (!el_spent).then(|| ocrouter_core::router::types::KeySelection {
+                        reason: format!("route step {id}"),
+                        key,
+                    })
                 });
+                let sticky = client_session
+                    .as_deref()
+                    .filter(|_| target.key.is_none())
+                    .and_then(|session| {
+                        let affinity = self.shared.affinity.lock().ok()?;
+                        let preferred = affinity.preferred(session)?;
+                        if excluded.contains(&preferred) {
+                            return None;
+                        }
+                        let keys = self.shared.keys.lock().ok()?;
+                        let key = keys.get(&preferred)?;
+                        if key.provider == provider && key.enabled {
+                            Some(ocrouter_core::router::types::KeySelection {
+                                key: key.clone(),
+                                reason: format!("sticky session reused {preferred}"),
+                            })
+                        } else {
+                            None
+                        }
+                    });
 
-                let selected = match sticky {
-                    Some(selection) => Some(selection),
-                    None => {
+                let selected = match (pinned, sticky) {
+                    (Some(pinned), _) => pinned,
+                    (None, Some(selection)) => Some(selection),
+                    (None, None) => {
                         let strategy = self
                             .shared
                             .strategy
                             .lock()
                             .map(|s| *s)
                             .unwrap_or(RoutingStrategy::PriorityFailover);
-                        self.shared
-                            .keys
-                            .lock()
-                            .ok()
-                            .and_then(|mut keys| {
-                                keys.select_for(provider, strategy, &excluded, now_ms)
-                            })
+                        self.shared.keys.lock().ok().and_then(|mut keys| {
+                            keys.select_for(provider, strategy, &excluded, now_ms)
+                        })
                     }
                 };
                 let Some(selection) = selected else {
@@ -505,6 +612,7 @@ impl Engine {
                         now_ms,
                         fallback_cooldown_ms: self.shared.config.cooldown_ms,
                         count_breaker_failure,
+                        advance_on_429: target.key.is_some(),
                     };
                     let mut breaker = self.shared.breaker.lock().expect("breaker poisoned");
                     let mut keys = self.shared.keys.lock().expect("keys poisoned");

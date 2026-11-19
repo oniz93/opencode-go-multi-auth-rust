@@ -14,7 +14,11 @@ pub enum RunOutcome {
 }
 
 #[derive(Parser)]
-#[command(name = "ocrouter", version, about = "Pool OpenCode accounts behind one local proxy")]
+#[command(
+    name = "ocrouter",
+    version,
+    about = "Pool OpenCode accounts behind one local proxy"
+)]
 struct Cli {
     #[arg(long, global = true)]
     keys: Option<PathBuf>,
@@ -60,7 +64,9 @@ enum KeyAction {
         secret: String,
     },
     List,
-    Rm { label: String },
+    Rm {
+        label: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -102,7 +108,10 @@ pub fn default_paths() -> (PathBuf, PathBuf) {
 /// `~/.config/ocrouter/control.token`, created on first use so the control API
 /// is never unauthenticated.
 pub fn load_or_create_control_token() -> std::io::Result<String> {
-    let path = home().join(".config").join("ocrouter").join("control.token");
+    let path = home()
+        .join(".config")
+        .join("ocrouter")
+        .join("control.token");
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let trimmed = existing.trim();
         if !trimmed.is_empty() {
@@ -147,7 +156,9 @@ fn parse_provider(value: &str) -> anyhow::Result<Provider> {
         "opencode-go" | "go" => Ok(Provider::OpenCodeGo),
         "opencode-console" | "console" => Ok(Provider::OpenCodeConsole),
         "experiential" | "el" => Ok(Provider::Experiential),
-        other => anyhow::bail!("unknown provider '{other}' (use opencode-go, opencode-console, or experiential)"),
+        other => anyhow::bail!(
+            "unknown provider '{other}' (use opencode-go, opencode-console, or experiential)"
+        ),
     }
 }
 
@@ -207,7 +218,10 @@ pub fn run(args: Vec<String>) -> anyhow::Result<RunOutcome> {
                         enabled: true,
                     });
                     keys.save(&keys_path)?;
-                    Ok(RunOutcome::Text(format!("added {id} to {}\n", keys_path.display())))
+                    Ok(RunOutcome::Text(format!(
+                        "added {id} to {}\n",
+                        keys_path.display()
+                    )))
                 }
                 KeyAction::List => {
                     if keys.key.is_empty() {
@@ -311,7 +325,8 @@ fn sync_models(config_path: &Path, keys_path: &Path, write: bool) -> anyhow::Res
 
     let catalog = ocrouter_core::models::Catalog::merged(go, el);
     let base = format!("http://127.0.0.1:{}/v1", config.proxy_port);
-    let snippet = ocrouter_core::models::opencode::generate_snippet(&catalog.models, &base);
+    let models = config.routing.exposed(&catalog.models);
+    let snippet = ocrouter_core::models::opencode::generate_snippet(&models, &base);
 
     if !write {
         return Ok(RunOutcome::Text(format!(
@@ -325,7 +340,7 @@ fn sync_models(config_path: &Path, keys_path: &Path, write: bool) -> anyhow::Res
     let backup = ocrouter_core::models::opencode::write_opencode_config(&target, &snippet)?;
     Ok(RunOutcome::Text(format!(
         "wrote {} models to {} (backup: {})\n",
-        catalog.models.len(),
+        models.len(),
         target.display(),
         backup.display()
     )))

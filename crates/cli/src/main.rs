@@ -60,7 +60,9 @@ async fn resolve_el_org(config: &Config, secret: &str) -> Option<String> {
         return None;
     }
     let json: serde_json::Value = response.json().await.ok()?;
-    json.get("org_id").and_then(|v| v.as_str()).map(str::to_string)
+    json.get("org_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 async fn serve() -> anyhow::Result<()> {
@@ -91,8 +93,7 @@ async fn serve() -> anyhow::Result<()> {
     let shared = engine.shared();
     let proxy = ProxyServer::new(engine);
 
-    let proxy_listener =
-        tokio::net::TcpListener::bind(("127.0.0.1", config.proxy_port)).await?;
+    let proxy_listener = tokio::net::TcpListener::bind(("127.0.0.1", config.proxy_port)).await?;
     let control_listener =
         tokio::net::TcpListener::bind(("127.0.0.1", config.control_port)).await?;
 
@@ -100,6 +101,8 @@ async fn serve() -> anyhow::Result<()> {
     let state = AppState {
         shared: shared.clone(),
         token: String::new(),
+        keys_path: Some(keys_path.clone()),
+        config_path: Some(config_path.clone()),
     };
     let api = ControlApi::new(state, token).router();
 
@@ -111,9 +114,10 @@ async fn serve() -> anyhow::Result<()> {
         keys.key.len()
     );
 
-    tokio::try_join!(
-        proxy.serve(proxy_listener),
-        async move { axum::serve(control_listener, api).await.map_err(anyhow::Error::from) },
-    )?;
+    tokio::try_join!(proxy.serve(proxy_listener), async move {
+        axum::serve(control_listener, api)
+            .await
+            .map_err(anyhow::Error::from)
+    },)?;
     Ok(())
 }
