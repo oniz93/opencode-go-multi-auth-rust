@@ -391,7 +391,11 @@ impl Dashboard {
                         Button::new(("model-pick", mi))
                             .ghost()
                             .xsmall()
-                            .label(format!("{} · {}", model.id, model.lane))
+                            .label(format!(
+                                "{} · {}",
+                                model.id,
+                                if model.lane == "console" { "zen" } else { &model.lane }
+                            ))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let id = id.clone();
                                 this.step_model
@@ -606,7 +610,7 @@ fn header(t: &Theme, connected: bool) -> Div {
                     div()
                         .text_xs()
                         .text_color(t.muted_foreground)
-                        .child("OpenCode Go + Experiential Labs key pool"),
+                        .child("OpenCode Go, Zen + Experiential Labs key pool"),
                 ),
         )
         .child(

@@ -68,3 +68,20 @@ fn models_are_sorted_by_id_for_stable_output() {
     let ids: Vec<&str> = c.models.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, vec!["a", "z"]);
 }
+
+#[test]
+fn zen_models_fill_only_ids_go_and_el_do_not_serve() {
+    let catalog = Catalog::merged(
+        vec![m("deepseek-v4.1-flash", Lane::Go)],
+        vec![m("deepseek-v4.1-flash-1017", Lane::Experiential)],
+    )
+    .with_console(vec![
+        m("deepseek-v4.1-flash", Lane::Console),
+        m("deepseek-v4.1-flash-free", Lane::Console),
+    ]);
+    assert_eq!(catalog.models.len(), 3);
+    assert_eq!(catalog.lane_for("deepseek-v4.1-flash"), Some(Lane::Go));
+    assert_eq!(catalog.lane_for("deepseek-v4.1-flash-free"), Some(Lane::Console));
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert!(ids.windows(2).all(|w| w[0] <= w[1]), "kept sorted: {ids:?}");
+}
