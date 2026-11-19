@@ -154,20 +154,20 @@ ocrouter service install|uninstall|status
 | `~/.config/ocrouter/config.toml`       | ports, upstream URLs, strategy    |
 | `~/.config/ocrouter/keys.toml`         | API keys (0600)                   |
 | `~/.config/ocrouter/control.token`     | control-API bearer token (0600)   |
+| `~/.config/ocrouter/state.json`        | key cooldowns + today's EL usage  |
+| `~/Library/Logs/ocrouter.*.log`        | launchd agent output              |
+
+The daemon reloads `keys.toml` within a few seconds of a change, so
+`ocrouter key add` needs no restart.
 
 ## Limitations
 
 - Zen `*-free` models are **not** usable through the proxy: the free tier rejects
   pooled API keys by policy. Use paid Go/Console models.
-- The control API's `POST /api/keys` adds a key to the running pool but does not
-  persist it to `keys.toml`; use `ocrouter key add` for durable keys.
 - One `Engine` guards routing state, so requests take a short lock while a
   decision is made (not for the life of a stream).
-- Cooldowns and the Experiential daily counter are **in memory** for v1; a
-  restart re-learns them. The upstream 429 remains authoritative, so the
-  no-credit-spend guarantee still holds.
-- `POST /api/keys` adds to the running pool but does not persist to
-  `keys.toml`; use `ocrouter key add`.
+- The proxy serves local programs only: requests with a non-loopback `Host` or
+  a browser `Origin` get `403`.
 
 ## License
 

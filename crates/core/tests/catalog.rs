@@ -51,3 +51,19 @@ fn el_entries_without_a_slug_are_skipped() {
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, "good");
 }
+
+#[test]
+fn model_list_urls_hit_v1_models_exactly_once() {
+    use ocrouter_core::config::Config;
+    use ocrouter_core::models::catalog::models_url;
+    use ocrouter_core::provider::{upstream_for, Provider};
+    let config = Config::default();
+    assert_eq!(
+        models_url(&upstream_for(Provider::Experiential, &config)),
+        "https://api.experientiallabs.ai/v1/models"
+    );
+    assert_eq!(
+        models_url(&upstream_for(Provider::OpenCodeGo, &config)),
+        "https://opencode.ai/inference/go/v1/models"
+    );
+}

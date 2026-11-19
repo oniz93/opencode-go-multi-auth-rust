@@ -43,10 +43,13 @@ fn app_at(
         keys: Arc::new(Mutex::new(KeyManager::from_keyfile(&kf))),
         breaker: Arc::new(Mutex::new(CircuitBreaker::new(
             config.circuit_breaker_threshold,
-            config.cooldown_ms,
+            config.breaker_open_ms,
         ))),
         allowance: Arc::new(Mutex::new(Allowance::new(1_000_000, 0.05))),
-        catalog: Arc::new(Catalog::merged(vec![], vec![])),
+        catalog: Arc::new(std::sync::RwLock::new(Arc::new(Catalog::merged(
+            vec![],
+            vec![],
+        )))),
         events: EventBus::new(64),
         affinity: Arc::new(Mutex::new(SessionAffinity::new())),
         strategy: Arc::new(Mutex::new(config.strategy)),

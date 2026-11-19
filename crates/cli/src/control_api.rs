@@ -1,11 +1,11 @@
 use std::convert::Infallible;
+use std::path::PathBuf;
 
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use std::path::PathBuf;
 
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -28,6 +28,24 @@ pub struct AppState {
     /// Where key and routing edits are persisted. `None` keeps them in memory (tests).
     pub keys_path: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
+}
+
+/// Apply `change` to `keys.toml`. A no-op when no path is configured.
+fn persist_keys(state: &AppState, change: impl FnOnce(&mut KeyFile)) -> anyhow::Result<()> {
+    let Some(path) = state.keys_path.as_deref() else {
+        return Ok(());
+    };
+    let mut file = KeyFile::load(path)?;
+    change(&mut file);
+    file.save(path)
+}
+
+fn persist_error(error: anyhow::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": format!("could not save: {error}") })),
+    )
+        .into_response()
 }
 
 pub struct ControlApi {
@@ -129,23 +147,6 @@ struct AddKeyRequest {
     weight: u32,
 }
 
-fn internal(error: anyhow::Error) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": error.to_string() })),
-    )
-        .into_response()
-}
-
-fn edit_keyfile(state: &AppState, edit: impl FnOnce(&mut KeyFile)) -> anyhow::Result<()> {
-    let Some(path) = state.keys_path.as_deref() else {
-        return Ok(());
-    };
-    let mut kf = KeyFile::load(path)?;
-    edit(&mut kf);
-    kf.save(path)
-}
-
 async fn add_key(State(state): State<AppState>, Json(body): Json<AddKeyRequest>) -> Response {
     if body.secret.trim().is_empty() || body.label.trim().is_empty() {
         return (
@@ -162,13 +163,9 @@ async fn add_key(State(state): State<AppState>, Json(body): Json<AddKeyRequest>)
         weight: body.weight,
         enabled: true,
     };
-    let saved = edit_keyfile(&state, |kf| {
-        kf.key
-            .retain(|k| !(k.provider == entry.provider && k.label == entry.label));
-        kf.add(entry.clone());
-    });
-    if let Err(error) = saved {
-        return internal(error);
+    // `KeyFile::add` replaces an entry with the same provider and label.
+    if let Err(error) = persist_keys(&state, |file| file.add(entry.clone())) {
+        return persist_error(error);
     }
     let body = entry;
     let id = ApiKey::new_id(body.provider, &body.label);
@@ -190,14 +187,14 @@ async fn add_key(State(state): State<AppState>, Json(body): Json<AddKeyRequest>)
 }
 
 async fn remove_key(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if let Err(error) = persist_keys(&state, |file| {
+        file.key
+            .retain(|k| ApiKey::new_id(k.provider, &k.label) != id)
+    }) {
+        return persist_error(error);
+    }
     let removed = state.shared.keys.lock().expect("keys poisoned").remove(&id);
     if removed {
-        if let Err(error) = edit_keyfile(&state, |kf| {
-            kf.key
-                .retain(|k| ApiKey::new_id(k.provider, &k.label) != id)
-        }) {
-            return internal(error);
-        }
         Json(json!({ "removed": id })).into_response()
     } else {
         (
@@ -248,7 +245,7 @@ async fn status(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<Value> {
-    let catalog = state.shared.catalog.as_ref();
+    let catalog = state.shared.catalog();
     let models: Vec<Value> = catalog
         .models
         .iter()
@@ -271,7 +268,7 @@ async fn snippet(State(state): State<AppState>) -> Json<Value> {
         .shared
         .routing
         .lock()
-        .map(|r| r.exposed(&state.shared.catalog.models))
+        .map(|r| r.exposed(&state.shared.catalog().models))
         .unwrap_or_default();
     let base = format!("http://127.0.0.1:{}/v1", state.shared.config.proxy_port);
     Json(generate_snippet(&models, &base))
@@ -307,7 +304,7 @@ async fn put_routing(State(state): State<AppState>, Json(body): Json<Routing>) -
             cfg.save(path)
         });
         if let Err(error) = saved {
-            return internal(error);
+            return persist_error(error);
         }
     }
     if let Ok(mut routing) = state.shared.routing.lock() {

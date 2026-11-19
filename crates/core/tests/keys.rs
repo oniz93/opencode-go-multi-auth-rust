@@ -86,3 +86,30 @@ fn missing_file_loads_empty() {
     let kf = KeyFile::load(&dir.path().join("nope.toml")).unwrap();
     assert!(kf.key.is_empty());
 }
+
+#[test]
+fn saving_over_a_loose_file_tightens_it_to_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("keys.toml");
+    std::fs::write(&p, "").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut kf = KeyFile::default();
+    kf.add(entry("go-1", "oc_secretvalue"));
+    kf.save(&p).unwrap();
+    let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert!(
+        !dir.path().join("keys.tmp").exists(),
+        "no temp file is left behind"
+    );
+}
+
+#[test]
+fn adding_an_existing_label_replaces_it() {
+    let mut kf = KeyFile::default();
+    kf.add(entry("go-1", "oc_old"));
+    kf.add(entry("go-1", "oc_new"));
+    assert_eq!(kf.key.len(), 1);
+    assert_eq!(kf.key[0].secret, "oc_new");
+}

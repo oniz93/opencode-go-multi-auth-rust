@@ -26,7 +26,13 @@ fn key_add_then_list_shows_only_a_preview() {
     run(arg_list(
         keys,
         &[
-            "key", "add", "--provider", "opencode-go", "--label", "go-1", "--secret",
+            "key",
+            "add",
+            "--provider",
+            "opencode-go",
+            "--label",
+            "go-1",
+            "--secret",
             "oc_abcdef123456",
         ],
     ))
@@ -46,7 +52,13 @@ fn key_rm_removes_by_label() {
     run(arg_list(
         keys,
         &[
-            "key", "add", "--provider", "experiential", "--label", "el-1", "--secret",
+            "key",
+            "add",
+            "--provider",
+            "experiential",
+            "--label",
+            "el-1",
+            "--secret",
             "xpl_zzzzzzzz",
         ],
     ))
@@ -97,4 +109,13 @@ fn version_and_help_are_successful_outputs() {
 
     let help = text(run(vec!["ocrouter".to_string(), "--help".to_string()]).unwrap());
     assert!(help.contains("serve"), "{help}");
+}
+
+#[test]
+fn control_tokens_are_long_and_unpredictable() {
+    let a = ocrouter_cli::cli::random_token().unwrap();
+    let b = ocrouter_cli::cli::random_token().unwrap();
+    assert_eq!(a.len(), 64);
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(a, b);
 }

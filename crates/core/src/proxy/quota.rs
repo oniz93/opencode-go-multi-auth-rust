@@ -15,6 +15,9 @@ const QUOTA_MARKERS: &[&str] = &[
     "exhausted",
 ];
 
+/// Go has monthly limits, so a month is the longest believable cooldown.
+pub const MAX_COOLDOWN_MS: u64 = 31 * 86_400_000;
+
 pub fn is_quota_error(status: u16, _headers: &HeaderMap, body: &str) -> bool {
     if status == 402 {
         return true;
@@ -35,10 +38,10 @@ fn parse_duration_text(s: &str) -> Option<u64> {
     let after_num = rest[num.len()..].trim_start();
     let unit = after_num.chars().next()?;
     let ms = match unit {
-        's' => n * 1_000,
-        'm' => n * 60_000,
-        'h' => n * 3_600_000,
-        'd' => n * 86_400_000,
+        's' => n.saturating_mul(1_000),
+        'm' => n.saturating_mul(60_000),
+        'h' => n.saturating_mul(3_600_000),
+        'd' => n.saturating_mul(86_400_000),
         _ => return None,
     };
     Some(ms)
@@ -50,14 +53,11 @@ fn parse_http_date_ms(value: &str) -> Option<u64> {
         .map(|dt| dt.with_timezone(&Utc).timestamp_millis().max(0) as u64)
 }
 
-pub fn resolve_cooldown_ms(
-    headers: &HeaderMap,
-    body: &str,
-    now_ms: u64,
-    fallback_ms: u64,
-) -> u64 {
+pub fn resolve_cooldown_ms(headers: &HeaderMap, body: &str, now_ms: u64, fallback_ms: u64) -> u64 {
     let resolved = from_headers(headers, now_ms).or_else(|| from_body(body, now_ms));
-    resolved.unwrap_or(fallback_ms).max(1_000)
+    resolved
+        .unwrap_or(fallback_ms)
+        .clamp(1_000, MAX_COOLDOWN_MS)
 }
 
 fn from_headers(headers: &HeaderMap, now_ms: u64) -> Option<u64> {
@@ -67,14 +67,14 @@ fn from_headers(headers: &HeaderMap, now_ms: u64) -> Option<u64> {
         if n == "retry-after" {
             // Either a delta-seconds value or an HTTP-date absolute instant.
             if let Ok(secs) = v.parse::<u64>() {
-                return Some(secs * 1_000);
+                return Some(secs.saturating_mul(1_000));
             }
             if let Some(abs) = parse_http_date_ms(v) {
                 return Some(abs.saturating_sub(now_ms));
             }
         } else if n.starts_with("x-codex-") && n.ends_with("-reset-after-seconds") {
             if let Ok(secs) = v.parse::<u64>() {
-                return Some(secs * 1_000);
+                return Some(secs.saturating_mul(1_000));
             }
         } else if n.starts_with("x-codex-") && n.ends_with("-reset-at") {
             if let Some(ts) = parse_http_date_ms(v).or_else(|| rfc3339_ms(v)) {
@@ -102,7 +102,7 @@ fn from_body(body: &str, now_ms: u64) -> Option<u64> {
             return Some(ms);
         }
         if let Some(secs) = err.get("retry_after").and_then(Value::as_u64) {
-            return Some(secs * 1_000);
+            return Some(secs.saturating_mul(1_000));
         }
         if let Some(at) = err.get("resets_at").and_then(Value::as_str) {
             if let Some(ts) = rfc3339_ms(at).or_else(|| parse_http_date_ms(at)) {

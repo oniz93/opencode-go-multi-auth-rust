@@ -253,3 +253,36 @@ fn allow_paid_keeps_using_el_after_the_free_allowance_is_spent() {
         Some(LaneChoice::Experiential)
     );
 }
+
+#[test]
+fn a_401_sidelines_the_key_and_fails_over() {
+    let mut cb = CircuitBreaker::new(3, 60_000);
+    let mut km = KeyManager::new(vec![key("a")]);
+    let mut allowance = Allowance::new(1_000_000, 0.0);
+    let headers = HeaderMap::new();
+    let out = classify(
+        signal(401, "{}", &headers, Provider::OpenCodeGo, None, true),
+        &mut cb,
+        &mut km,
+        &mut allowance,
+    );
+    assert_eq!(out, Attempt::Retry);
+    assert_eq!(km.get("a").unwrap().status, KeyStatus::Exhausted);
+    assert!(!km.is_selectable("a", &Default::default(), 500));
+}
+
+#[test]
+fn a_success_clears_the_error_count() {
+    let mut cb = CircuitBreaker::new(3, 60_000);
+    let mut km = KeyManager::new(vec![key("a")]);
+    km.record_error("a");
+    let mut allowance = Allowance::new(1_000_000, 0.0);
+    let headers = HeaderMap::new();
+    classify(
+        signal(200, "{}", &headers, Provider::OpenCodeGo, None, true),
+        &mut cb,
+        &mut km,
+        &mut allowance,
+    );
+    assert_eq!(km.get("a").unwrap().consecutive_errors, 0);
+}
