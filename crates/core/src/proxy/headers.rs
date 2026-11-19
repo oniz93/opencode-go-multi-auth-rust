@@ -79,10 +79,16 @@ pub fn build_upstream_headers(
     let mut out = HeaderMap::new();
     for (name, value) in client.iter() {
         let lower = name.as_str().to_ascii_lowercase();
-        if is_hop_by_hop(&lower) || lower == "authorization" || lower == "x-api-key" {
+        // `accept-encoding` is dropped so the upstream answers uncompressed: the
+        // proxy reads error bodies for quota signals and has no decompressor.
+        if is_hop_by_hop(&lower)
+            || lower == "authorization"
+            || lower == "x-api-key"
+            || lower == "accept-encoding"
+        {
             continue;
         }
-        out.insert(name.clone(), value.clone());
+        out.append(name.clone(), value.clone());
     }
 
     if let Ok(value) = HeaderValue::from_str(&format!("Bearer {secret}")) {

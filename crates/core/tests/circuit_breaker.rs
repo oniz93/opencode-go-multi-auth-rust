@@ -43,3 +43,21 @@ fn an_unknown_key_is_available() {
     assert!(cb.is_available("never-seen", 0));
     assert_eq!(cb.state_of("never-seen", 0), CircuitState::Closed);
 }
+
+#[test]
+fn a_failed_half_open_probe_reopens_the_circuit() {
+    let mut cb = CircuitBreaker::new(3, 1_000);
+    for _ in 0..3 {
+        cb.record_failure("k", 0);
+    }
+    assert_eq!(cb.state_of("k", 1_000), CircuitState::HalfOpen);
+    assert_eq!(cb.record_failure("k", 1_000), CircuitState::Open);
+    assert!(
+        !cb.is_available("k", 1_500),
+        "a dead key must be sidelined again"
+    );
+    assert!(
+        cb.is_available("k", 2_000),
+        "and probed again after another open period"
+    );
+}

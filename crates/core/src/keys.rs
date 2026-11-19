@@ -60,6 +60,24 @@ pub fn mask_secret(secret: &str) -> String {
     mask(secret)
 }
 
+/// Write a secret-bearing file as `0600` via a sibling temp file and a rename,
+/// so a crash mid-write never truncates it and an old loose mode never sticks.
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
 impl KeyFile {
     pub fn load(path: &Path) -> anyhow::Result<KeyFile> {
         if !path.exists() {
@@ -70,22 +88,21 @@ impl KeyFile {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let raw = toml::to_string_pretty(self)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(raw.as_bytes())?;
+        write_private(path, toml::to_string_pretty(self)?.as_bytes())?;
         Ok(())
     }
 
+    /// Insert, or replace the entry with the same provider and label (two
+    /// entries with one label would collide on the router's key id).
     pub fn add(&mut self, entry: KeyEntry) {
-        self.key.push(entry);
+        match self
+            .key
+            .iter_mut()
+            .find(|k| k.provider == entry.provider && k.label == entry.label)
+        {
+            Some(existing) => *existing = entry,
+            None => self.key.push(entry),
+        }
     }
 
     pub fn remove(&mut self, label: &str) -> bool {

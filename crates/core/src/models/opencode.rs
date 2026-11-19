@@ -22,7 +22,10 @@ fn model_entry(model: &ModelInfo) -> Value {
             json!({ "input": model.input_price, "output": model.output_price }),
         );
     }
-    obj.insert("capabilities".to_string(), json!({ "tools": model.supports_tools }));
+    obj.insert(
+        "capabilities".to_string(),
+        json!({ "tools": model.supports_tools }),
+    );
     obj.insert(
         "modalities".to_string(),
         json!({ "input": model.modalities_in, "output": ["text"] }),
@@ -69,12 +72,19 @@ fn backup_path(config_path: &Path) -> PathBuf {
 pub fn write_opencode_config(config_path: &Path, snippet: &Value) -> anyhow::Result<PathBuf> {
     let mut root: Value = if config_path.exists() {
         let raw = std::fs::read_to_string(config_path)?;
-        serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
+        // A file we cannot parse (JSONC comments, trailing commas) is left
+        // alone rather than replaced by a config holding only our block.
+        serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "{} is not plain JSON ({e}); add the snippet by hand",
+                config_path.display()
+            )
+        })?
     } else {
         json!({})
     };
     if !root.is_object() {
-        root = json!({});
+        anyhow::bail!("{} is not a JSON object", config_path.display());
     }
 
     let block = snippet

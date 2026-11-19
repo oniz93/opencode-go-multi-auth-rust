@@ -45,7 +45,10 @@ fn retry_after_header_wins() {
 fn retry_after_http_date_is_parsed() {
     let mut h = HeaderMap::new();
     // 2026-11-18T00:02:00Z == 1_763_433_720_000 ms; now = 00:00:00Z
-    h.insert("retry-after", "Wed, 18 Nov 2026 00:02:00 GMT".parse().unwrap());
+    h.insert(
+        "retry-after",
+        "Wed, 18 Nov 2026 00:02:00 GMT".parse().unwrap(),
+    );
     let now = 1_794_960_000_000;
     assert_eq!(resolve_cooldown_ms(&h, "", now, 9), 120_000);
 }
@@ -117,14 +120,39 @@ fn fallback_used_when_nothing_present() {
 #[test]
 fn a_past_retry_after_is_floored_not_negative() {
     let mut h = HeaderMap::new();
-    h.insert("retry-after", "Wed, 18 Nov 2026 00:00:00 GMT".parse().unwrap());
+    h.insert(
+        "retry-after",
+        "Wed, 18 Nov 2026 00:00:00 GMT".parse().unwrap(),
+    );
     let now = 1_794_960_000_000; // exactly that instant
     assert!(resolve_cooldown_ms(&h, "", now, 5_000) >= 1_000);
 }
 
 #[test]
 fn quota_message_prefers_code_then_type_then_message() {
-    let msg = extract_quota_message(r#"{"error":{"code":"insufficient_quota","type":"x","message":"y"}}"#, 429);
+    let msg = extract_quota_message(
+        r#"{"error":{"code":"insufficient_quota","type":"x","message":"y"}}"#,
+        429,
+    );
     assert!(msg.contains("insufficient_quota"));
     assert_eq!(extract_quota_message("not json", 429), "HTTP 429");
+}
+
+#[test]
+fn absurd_retry_after_values_neither_overflow_nor_exceed_a_month() {
+    let mut h = HeaderMap::new();
+    h.insert("retry-after", u64::MAX.to_string().parse().unwrap());
+    assert_eq!(
+        resolve_cooldown_ms(&h, "", 0, 1_000),
+        ocrouter_core::proxy::quota::MAX_COOLDOWN_MS
+    );
+    assert_eq!(
+        resolve_cooldown_ms(
+            &HeaderMap::new(),
+            "retry after 99999999999999999 d",
+            0,
+            1_000
+        ),
+        ocrouter_core::proxy::quota::MAX_COOLDOWN_MS
+    );
 }

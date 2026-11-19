@@ -6,8 +6,6 @@ use ocrouter_core::config::{Config, RoutingStrategy};
 use ocrouter_core::keys::{KeyEntry, KeyFile};
 use ocrouter_core::provider::Provider;
 
-use std::os::unix::fs::OpenOptionsExt;
-
 pub enum RunOutcome {
     Text(String),
     Serve,
@@ -114,29 +112,24 @@ pub fn load_or_create_control_token() -> std::io::Result<String> {
         .join("control.token");
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let trimmed = existing.trim();
-        if !trimmed.is_empty() {
+        // Older builds wrote a guessable time+pid token; replace those.
+        if trimmed.len() >= TOKEN_HEX_LEN {
             return Ok(trimmed.to_string());
         }
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let token = format!("{nanos:x}{:x}", std::process::id());
-    {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(token.as_bytes())?;
-    }
+    let token = random_token()?;
+    ocrouter_core::keys::write_private(&path, token.as_bytes())?;
     Ok(token)
+}
+
+const TOKEN_HEX_LEN: usize = 64;
+
+/// 32 bytes from the OS CSPRNG, hex-encoded.
+pub fn random_token() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; TOKEN_HEX_LEN / 2];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// `--secret -` reads one line from stdin so a credential never has to appear
@@ -359,6 +352,13 @@ fn install_service() -> anyhow::Result<String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let logs = home().join("Library").join("Logs");
+    std::fs::create_dir_all(&logs)?;
+    let xml = |s: String| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -366,15 +366,17 @@ fn install_service() -> anyhow::Result<String> {
 <dict>
   <key>Label</key><string>com.ocrouter.daemon</string>
   <key>ProgramArguments</key>
-  <array><string>{}</string><string>serve</string></array>
+  <array><string>{exe}</string><string>serve</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/ocrouter.out.log</string>
-  <key>StandardErrorPath</key><string>/tmp/ocrouter.err.log</string>
+  <key>StandardOutPath</key><string>{out}</string>
+  <key>StandardErrorPath</key><string>{err}</string>
 </dict>
 </plist>
 "#,
-        exe.display()
+        exe = xml(exe.display().to_string()),
+        out = xml(logs.join("ocrouter.out.log").display().to_string()),
+        err = xml(logs.join("ocrouter.err.log").display().to_string()),
     );
     std::fs::write(&path, plist)?;
     let _ = std::process::Command::new("launchctl")

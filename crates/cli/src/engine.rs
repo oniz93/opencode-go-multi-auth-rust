@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 
 use futures_util::StreamExt;
 use http::HeaderMap;
@@ -16,7 +16,9 @@ use ocrouter_core::router::allowance::Allowance;
 use ocrouter_core::router::circuit_breaker::CircuitBreaker;
 use ocrouter_core::router::key_manager::KeyManager;
 use ocrouter_core::router::session_affinity::SessionAffinity;
+use ocrouter_core::router::types::KeySelection;
 use ocrouter_core::router::types::RoutingStrategy;
+use ocrouter_core::state::{KeyHealth, OrgUsage, RouterState};
 
 use crate::body::{ByteStream, ProxyBody};
 
@@ -65,7 +67,8 @@ pub struct Shared {
     pub keys: Arc<Mutex<KeyManager>>,
     pub breaker: Arc<Mutex<CircuitBreaker>>,
     pub allowance: Arc<Mutex<Allowance>>,
-    pub catalog: Arc<Catalog>,
+    /// Swapped wholesale by the background refresh; readers clone the `Arc`.
+    pub catalog: Arc<RwLock<Arc<Catalog>>>,
     pub events: EventBus,
     pub affinity: Arc<Mutex<SessionAffinity>>,
     pub strategy: Arc<Mutex<RoutingStrategy>>,
@@ -89,9 +92,86 @@ impl Target {
     }
 }
 
+impl Shared {
+    pub fn catalog(&self) -> Arc<Catalog> {
+        self.catalog
+            .read()
+            .map(|c| Arc::clone(&c))
+            .unwrap_or_else(|e| Arc::clone(&e.into_inner()))
+    }
+
+    pub fn set_catalog(&self, catalog: Catalog) {
+        if let Ok(mut slot) = self.catalog.write() {
+            *slot = Arc::new(catalog);
+        }
+    }
+
+    /// Key health and per-org allowance, for `state.json`. Carries no secret.
+    pub fn health_snapshot(&self) -> RouterState {
+        let keys = self
+            .keys
+            .lock()
+            .map(|keys| {
+                keys.all()
+                    .iter()
+                    .map(|k| KeyHealth {
+                        id: k.id.clone(),
+                        provider: k.provider,
+                        label: k.label.clone(),
+                        status: k.status,
+                        consecutive_errors: k.consecutive_errors,
+                        cooldown_until_ms: k.cooldown_until_ms,
+                        tokens_today: 0,
+                        cost_accumulated: 0.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let allowance = self
+            .allowance
+            .lock()
+            .map(|a| {
+                a.snapshot()
+                    .into_iter()
+                    .map(|(org, used, limit)| OrgUsage { org, used, limit })
+                    .collect()
+            })
+            .unwrap_or_default();
+        RouterState {
+            keys,
+            allowance,
+            recent_events: Vec::new(),
+            saved_at_ms: 0,
+        }
+    }
+
+    /// Re-apply a saved snapshot so a restart keeps cooldowns and today's
+    /// allowance usage. Keys no longer in the pool are ignored.
+    pub fn restore(&self, state: &RouterState, now_ms: u64) {
+        if let Ok(mut keys) = self.keys.lock() {
+            for key in keys.iter_mut() {
+                if let Some(saved) = state.keys.iter().find(|h| h.id == key.id) {
+                    key.status = saved.status;
+                    key.consecutive_errors = saved.consecutive_errors;
+                    key.cooldown_until_ms = saved.cooldown_until_ms;
+                }
+            }
+        }
+        if let Ok(mut allowance) = self.allowance.lock() {
+            for org in &state.allowance {
+                allowance.record(&org.org, org.used, state.saved_at_ms);
+            }
+            allowance.reset_if_new_utc_day(now_ms);
+        }
+    }
+}
+
 pub struct Engine {
     shared: Shared,
-    el_org: Option<String>,
+    /// Org for EL keys with no resolved org of their own (and keys added later).
+    el_default_org: Option<String>,
+    /// `key id -> org_id` from `/api/whoami`; the allowance is per org.
+    key_orgs: HashMap<String, String>,
 }
 
 fn host_of(url: &str) -> String {
@@ -189,6 +269,8 @@ async fn collect(body: ProxyBody) -> Vec<u8> {
     }
 }
 
+const TEE_TAIL_BYTES: usize = 65_536;
+
 /// Relay a stream unchanged, accumulating a bounded tail so the final SSE usage
 /// frame can be recorded against the org's allowance.
 fn tee_usage(
@@ -197,22 +279,23 @@ fn tee_usage(
     org: Option<String>,
     now_ms: u64,
 ) -> ByteStream {
-    let state = (inner, String::new(), allowance, org);
+    let state = (inner, Vec::<u8>::new(), allowance, org);
     Box::pin(futures_util::stream::unfold(
         state,
         move |(mut inner, mut acc, allowance, org)| async move {
             match inner.next().await {
                 Some(Ok(chunk)) => {
-                    acc.push_str(&String::from_utf8_lossy(&chunk));
-                    if acc.len() > 65_536 {
-                        let cut = acc.len() - 65_536;
-                        acc.drain(..cut);
+                    acc.extend_from_slice(&chunk);
+                    if acc.len() > TEE_TAIL_BYTES {
+                        acc.drain(..acc.len() - TEE_TAIL_BYTES);
                     }
                     Some((Ok(chunk), (inner, acc, allowance, org)))
                 }
                 Some(Err(error)) => Some((Err(error), (inner, acc, allowance, org))),
                 None => {
-                    if let (Some(org), Some(usage)) = (org.as_deref(), parse_usage_from_sse(&acc)) {
+                    let tail = String::from_utf8_lossy(&acc);
+                    if let (Some(org), Some(usage)) = (org.as_deref(), parse_usage_from_sse(&tail))
+                    {
                         if let Ok(mut allowance) = allowance.lock() {
                             allowance.record(org, usage.total(), now_ms);
                         }
@@ -236,7 +319,7 @@ fn response_body_stream(body: ProxyBody) -> ByteStream {
 impl Engine {
     pub fn new(config: Config, keyfile: &KeyFile, catalog: Catalog) -> Self {
         let keys = KeyManager::from_keyfile(keyfile);
-        let breaker = CircuitBreaker::new(config.circuit_breaker_threshold, config.cooldown_ms);
+        let breaker = CircuitBreaker::new(config.circuit_breaker_threshold, config.breaker_open_ms);
         let allowance = Allowance::new(config.el_daily_token_cap, config.el_safety_margin);
         let strategy = config.strategy;
         let routing = config.routing.clone();
@@ -246,13 +329,14 @@ impl Engine {
                 keys: Arc::new(Mutex::new(keys)),
                 breaker: Arc::new(Mutex::new(breaker)),
                 allowance: Arc::new(Mutex::new(allowance)),
-                catalog: Arc::new(catalog),
+                catalog: Arc::new(RwLock::new(Arc::new(catalog))),
                 events: EventBus::new(512),
                 affinity: Arc::new(Mutex::new(SessionAffinity::new())),
                 strategy: Arc::new(Mutex::new(strategy)),
                 routing: Arc::new(Mutex::new(routing)),
             },
-            el_org: None,
+            el_default_org: None,
+            key_orgs: HashMap::new(),
         }
     }
 
@@ -261,7 +345,42 @@ impl Engine {
     }
 
     pub fn set_el_org(&mut self, org: Option<String>) {
-        self.el_org = org;
+        self.el_default_org = org;
+    }
+
+    /// Record the org a specific EL key belongs to.
+    pub fn set_key_org(&mut self, key_id: &str, org: String) {
+        self.key_orgs.insert(key_id.to_string(), org);
+    }
+
+    fn org_for(&self, key_id: &str) -> Option<String> {
+        self.key_orgs
+            .get(key_id)
+            .or(self.el_default_org.as_ref())
+            .cloned()
+    }
+
+    /// Distinct orgs behind the enabled EL keys, in key order.
+    fn el_orgs(&self) -> Vec<String> {
+        let ids: Vec<String> = self
+            .shared
+            .keys
+            .lock()
+            .map(|keys| {
+                keys.all()
+                    .iter()
+                    .filter(|k| k.provider == Provider::Experiential && k.enabled)
+                    .map(|k| k.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut orgs: Vec<String> = Vec::new();
+        for org in ids.iter().filter_map(|id| self.org_for(id)) {
+            if !orgs.contains(&org) {
+                orgs.push(org);
+            }
+        }
+        orgs
     }
 
     pub fn record_el_usage(&self, org: &str, tokens: u64, now_ms: u64) {
@@ -281,7 +400,7 @@ impl Engine {
     /// Set the Experiential org. A failed lookup must not silently disable the
     /// free lane, so an unknown org falls back to a stable local label.
     pub fn ensure_el_org(&mut self, found: Option<String>) {
-        self.el_org = Some(found.unwrap_or_else(|| "default".to_string()));
+        self.el_default_org = Some(found.unwrap_or_else(|| "default".to_string()));
     }
 
     pub fn breaker_failures(&self, key_id: &str) -> u32 {
@@ -294,28 +413,6 @@ impl Engine {
 
     pub fn events(&self) -> &EventBus {
         &self.shared.events
-    }
-
-    fn resolve_session(
-        &self,
-        provider: Provider,
-        headers: &HeaderMap,
-        client_session: Option<&str>,
-    ) -> String {
-        if let Some(session) = client_session {
-            return session.to_string();
-        }
-        if provider == Provider::OpenCodeGo {
-            if let Some(cache_key) = headers
-                .get("prompt-cache-key")
-                .and_then(|v| v.to_str().ok())
-            {
-                if !cache_key.is_empty() {
-                    return format!("ses_{cache_key}");
-                }
-            }
-        }
-        generate_session_id()
     }
 
     fn targets(&self, explicit: Option<Lane>, model: Option<&str>) -> Vec<Target> {
@@ -346,32 +443,39 @@ impl Engine {
     }
 
     fn lane_targets(&self, explicit: Option<Lane>, model: Option<&str>) -> Vec<Provider> {
+        let catalog = self.shared.catalog();
         match explicit {
             Some(Lane::Go) => vec![Provider::OpenCodeGo],
             Some(Lane::Console) => vec![Provider::OpenCodeConsole],
             Some(Lane::Experiential) => {
                 let mut targets = vec![Provider::Experiential];
-                if model.is_some_and(|m| self.shared.catalog.has_go_fallback(m)) {
+                if model.is_some_and(|m| catalog.has_go_fallback(m)) {
                     targets.push(Provider::OpenCodeGo);
                 }
                 targets
             }
             None => {
                 let model = model.unwrap_or_default();
+                let orgs = self.el_orgs();
                 let choice = {
                     let allowance = self.shared.allowance.lock().expect("allowance poisoned");
+                    // Any org with budget left keeps the free lane open.
+                    let org = orgs
+                        .iter()
+                        .find(|org| !allowance.is_exhausted(org))
+                        .or(orgs.first());
                     choose_lane(
                         model,
-                        &self.shared.catalog,
+                        &catalog,
                         &allowance,
-                        self.el_org.as_deref(),
+                        org.map(String::as_str),
                         self.shared.config.el_allow_paid,
                     )
                 };
                 match choice {
                     Some(LaneChoice::Experiential) => {
                         let mut targets = vec![Provider::Experiential];
-                        if self.shared.catalog.has_go_fallback(model) {
+                        if catalog.has_go_fallback(model) {
                             targets.push(Provider::OpenCodeGo);
                         }
                         targets
@@ -405,7 +509,7 @@ impl Engine {
                 .shared
                 .routing
                 .lock()
-                .map(|r| r.exposed(&self.shared.catalog.models))
+                .map(|r| r.exposed(&self.shared.catalog().models))
                 .unwrap_or_default();
             let data: Vec<serde_json::Value> = exposed
                 .iter()
@@ -448,7 +552,14 @@ impl Engine {
             };
         }
 
-        let mut body_5xx_seen = false;
+        // Go rejects a request without a session; one id per request keeps
+        // retries on the same conversation. Without a client header there is
+        // nothing stable to derive it from (bodies are never read for routing).
+        let session = client_session.clone().unwrap_or_else(generate_session_id);
+        let logged_path = incoming.path.split('?').next().unwrap_or_default();
+        // Only the first failure of a request counts against a breaker, so one
+        // bad body or one network outage cannot open every key's breaker.
+        let mut failure_seen = false;
         let mut last: Option<ProxyOutcome> = None;
 
         for target in targets {
@@ -483,11 +594,11 @@ impl Engine {
                 let pinned = target.key.as_deref().map(|id| {
                     let el_spent = provider == Provider::Experiential
                         && !self.shared.config.el_allow_paid
-                        && self.el_org.as_deref().is_some_and(|org| {
+                        && self.org_for(id).is_some_and(|org| {
                             self.shared
                                 .allowance
                                 .lock()
-                                .map(|a| a.is_exhausted(org))
+                                .map(|a| a.is_exhausted(&org))
                                 .unwrap_or(false)
                         });
                     let keys = self.shared.keys.lock().ok()?;
@@ -496,7 +607,7 @@ impl Engine {
                         .into_iter()
                         .find(|k| k.id == id)?
                         .clone();
-                    (!el_spent).then(|| ocrouter_core::router::types::KeySelection {
+                    (!el_spent).then(|| KeySelection {
                         reason: format!("route step {id}"),
                         key,
                     })
@@ -512,8 +623,10 @@ impl Engine {
                         }
                         let keys = self.shared.keys.lock().ok()?;
                         let key = keys.get(&preferred)?;
-                        if key.provider == provider && key.enabled {
-                            Some(ocrouter_core::router::types::KeySelection {
+                        if key.provider == provider
+                            && keys.is_selectable(&preferred, &excluded, now_ms)
+                        {
+                            Some(KeySelection {
                                 key: key.clone(),
                                 reason: format!("sticky session reused {preferred}"),
                             })
@@ -551,8 +664,6 @@ impl Engine {
                     continue;
                 }
 
-                let session =
-                    self.resolve_session(provider, &incoming.headers, client_session.as_deref());
                 let headers = build_upstream_headers(
                     &incoming.headers,
                     &selection.key.secret,
@@ -571,9 +682,12 @@ impl Engine {
                 let response = match client.send(request).await {
                     Ok(response) => response,
                     Err(error) => {
-                        if let Ok(mut breaker) = self.shared.breaker.lock() {
-                            breaker.record_failure(&selection.key.id, now_ms);
+                        if !failure_seen {
+                            if let Ok(mut breaker) = self.shared.breaker.lock() {
+                                breaker.record_failure(&selection.key.id, now_ms);
+                            }
                         }
+                        failure_seen = true;
                         self.shared.events.emit(EventRecord {
                             at_ms: now_ms,
                             level: Level::Error,
@@ -587,11 +701,17 @@ impl Engine {
 
                 let status = response.status;
                 let streaming = status < 400 && is_event_stream(&response.headers);
-                let (text, stream_body) = if streaming {
-                    (String::new(), Some(response.body))
+                let (raw, stream_body) = if streaming {
+                    (Vec::new(), Some(response.body))
                 } else {
-                    let bytes = collect(response.body).await;
-                    (String::from_utf8_lossy(&bytes).to_string(), None)
+                    (collect(response.body).await, None)
+                };
+                // Peek as text for quota markers and usage; relay `raw` untouched.
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                let org = if provider == Provider::Experiential {
+                    self.org_for(&selection.key.id)
+                } else {
+                    None
                 };
                 let usage = if streaming {
                     None
@@ -599,7 +719,7 @@ impl Engine {
                     parse_usage(&text, shape_for(&forward_path))
                 };
 
-                let count_breaker_failure = !body_5xx_seen;
+                let count_breaker_failure = !failure_seen;
                 let attempt = {
                     let signal = ResponseSignal {
                         status,
@@ -607,7 +727,7 @@ impl Engine {
                         body_peek: &text,
                         key_id: &selection.key.id,
                         provider,
-                        org: self.el_org.as_deref(),
+                        org: org.as_deref(),
                         usage,
                         now_ms,
                         fallback_cooldown_ms: self.shared.config.cooldown_ms,
@@ -620,7 +740,7 @@ impl Engine {
                     classify(signal, &mut breaker, &mut keys, &mut allowance)
                 };
                 if status >= 500 {
-                    body_5xx_seen = true;
+                    failure_seen = true;
                 }
 
                 let level = match status {
@@ -633,7 +753,7 @@ impl Engine {
                     level,
                     message: format!(
                         "{} {} -> {} via {}",
-                        incoming.method, incoming.path, status, selection.key.id
+                        incoming.method, logged_path, status, selection.key.id
                     ),
                     detail: None,
                 });
@@ -643,7 +763,7 @@ impl Engine {
                     last = Some(ProxyOutcome {
                         status,
                         headers: response.headers.clone(),
-                        body: ProxyBody::bytes(text.into_bytes()),
+                        body: ProxyBody::bytes(raw),
                     });
                     continue;
                 }
@@ -655,20 +775,13 @@ impl Engine {
                 }
 
                 let out_body = match stream_body {
-                    Some(body) => {
-                        let tee_org = if provider == Provider::Experiential {
-                            self.el_org.clone()
-                        } else {
-                            None
-                        };
-                        ProxyBody::Stream(tee_usage(
-                            response_body_stream(body),
-                            Arc::clone(&self.shared.allowance),
-                            tee_org,
-                            now_ms,
-                        ))
-                    }
-                    None => ProxyBody::bytes(text.into_bytes()),
+                    Some(body) => ProxyBody::Stream(tee_usage(
+                        response_body_stream(body),
+                        Arc::clone(&self.shared.allowance),
+                        org,
+                        now_ms,
+                    )),
+                    None => ProxyBody::bytes(raw),
                 };
                 return ProxyOutcome {
                     status,

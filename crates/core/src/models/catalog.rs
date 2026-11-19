@@ -136,16 +136,18 @@ pub fn parse_el_catalog(raw: &str) -> Option<Vec<ModelInfo>> {
     Some(models)
 }
 
+/// The model-list URL. The EL base already ends in `/v1`, so plain
+/// concatenation produced `/v1/v1/models` (404) and an empty EL catalog.
+pub fn models_url(upstream: &Upstream) -> String {
+    crate::proxy::routing::build_upstream_url(&upstream.base_url, upstream.model_list_path)
+}
+
 pub async fn fetch_models(
     client: &reqwest::Client,
     upstream: &Upstream,
     secret: Option<&str>,
 ) -> anyhow::Result<Vec<ModelInfo>> {
-    let url = format!(
-        "{}{}",
-        upstream.base_url.trim_end_matches('/'),
-        upstream.model_list_path
-    );
+    let url = models_url(upstream);
     let mut request = client.get(&url);
     if let Some(secret) = secret {
         request = request.bearer_auth(secret);

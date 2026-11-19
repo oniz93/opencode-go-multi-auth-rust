@@ -1,8 +1,8 @@
 use http::HeaderMap;
+use ocrouter_core::provider::AuthStyle;
 use ocrouter_core::proxy::headers::{
     build_upstream_headers, ensure_go_session, generate_session_id, is_hop_by_hop, PASSTHROUGH,
 };
-use ocrouter_core::provider::AuthStyle;
 
 #[test]
 fn both_auth_headers_are_sent_for_go() {
@@ -98,7 +98,10 @@ fn passthrough_list_names_the_cache_headers() {
         "cache-control",
         "anthropic-beta",
     ] {
-        assert!(PASSTHROUGH.contains(&name), "{name} missing from PASSTHROUGH");
+        assert!(
+            PASSTHROUGH.contains(&name),
+            "{name} missing from PASSTHROUGH"
+        );
     }
 }
 
@@ -108,4 +111,24 @@ fn generated_session_ids_are_unique_enough() {
     let b = generate_session_id();
     assert_ne!(a, b);
     assert!(a.starts_with("ses_"));
+}
+
+#[test]
+fn accept_encoding_is_not_forwarded_and_repeated_headers_survive() {
+    let mut client = HeaderMap::new();
+    client.insert("accept-encoding", "gzip, br".parse().unwrap());
+    client.append("anthropic-beta", "a".parse().unwrap());
+    client.append("anthropic-beta", "b".parse().unwrap());
+    let h = build_upstream_headers(
+        &client,
+        "oc_x",
+        "opencode.ai",
+        AuthStyle::BearerAndApiKey,
+        "s",
+    );
+    assert!(
+        !h.contains_key("accept-encoding"),
+        "upstream must answer uncompressed"
+    );
+    assert_eq!(h.get_all("anthropic-beta").iter().count(), 2);
 }

@@ -1,12 +1,11 @@
 use std::convert::Infallible;
+use std::path::PathBuf;
 
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use std::path::PathBuf;
-
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::Stream;
@@ -248,7 +247,7 @@ async fn status(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<Value> {
-    let catalog = state.shared.catalog.as_ref();
+    let catalog = state.shared.catalog();
     let models: Vec<Value> = catalog
         .models
         .iter()
@@ -271,7 +270,7 @@ async fn snippet(State(state): State<AppState>) -> Json<Value> {
         .shared
         .routing
         .lock()
-        .map(|r| r.exposed(&state.shared.catalog.models))
+        .map(|r| r.exposed(&state.shared.catalog().models))
         .unwrap_or_default();
     let base = format!("http://127.0.0.1:{}/v1", state.shared.config.proxy_port);
     Json(generate_snippet(&models, &base))
