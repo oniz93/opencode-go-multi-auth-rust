@@ -45,7 +45,11 @@ impl CircuitBreaker {
             opened_at_ms: None,
         });
         entry.consecutive_failures += 1;
-        if entry.opened_at_ms.is_none() && entry.consecutive_failures >= self.threshold {
+        // Closed: open at the threshold. Half-open: a failed probe re-opens.
+        let lapsed = entry
+            .opened_at_ms
+            .is_none_or(|opened| now_ms.saturating_sub(opened) >= self.open_ms);
+        if lapsed && entry.consecutive_failures >= self.threshold {
             entry.opened_at_ms = Some(now_ms);
         }
         self.state_of(id, now_ms)
@@ -59,6 +63,9 @@ impl CircuitBreaker {
     }
 
     pub fn consecutive_failures(&self, id: &str) -> u32 {
-        self.entries.get(id).map(|e| e.consecutive_failures).unwrap_or(0)
+        self.entries
+            .get(id)
+            .map(|e| e.consecutive_failures)
+            .unwrap_or(0)
     }
 }

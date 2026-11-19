@@ -87,6 +87,17 @@ pub fn classify(
         return Attempt::Retry;
     }
 
+    // The proxy owns the credential, so a 401 is this key's fault (revoked or
+    // mistyped): sideline it and fail over instead of failing every request.
+    if signal.status == 401 {
+        keys.mark_exhausted(
+            signal.key_id,
+            signal.now_ms.saturating_add(signal.fallback_cooldown_ms),
+        );
+        keys.record_error(signal.key_id);
+        return Attempt::Retry;
+    }
+
     if signal.status >= 500 {
         if signal.count_breaker_failure {
             breaker.record_failure(signal.key_id, signal.now_ms);
@@ -96,6 +107,7 @@ pub fn classify(
     }
 
     breaker.record_success(signal.key_id);
+    keys.record_success(signal.key_id);
     if signal.provider == Provider::Experiential {
         if let (Some(org), Some(usage)) = (signal.org, signal.usage) {
             allowance.record(org, usage.total(), signal.now_ms);

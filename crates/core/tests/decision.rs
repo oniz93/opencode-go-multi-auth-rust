@@ -1,7 +1,7 @@
 use http::HeaderMap;
 use ocrouter_core::models::{Catalog, Lane, ModelInfo};
 use ocrouter_core::provider::Provider;
-use ocrouter_core::proxy::decision::{classify, choose_lane, Attempt, LaneChoice, ResponseSignal};
+use ocrouter_core::proxy::decision::{choose_lane, classify, Attempt, LaneChoice, ResponseSignal};
 use ocrouter_core::proxy::usage::TokenUsage;
 use ocrouter_core::router::allowance::Allowance;
 use ocrouter_core::router::circuit_breaker::{CircuitBreaker, CircuitState};
@@ -64,7 +64,10 @@ fn a_shared_model_goes_to_el_first_then_go_when_the_budget_is_gone() {
 fn a_go_only_model_ignores_the_el_budget() {
     let catalog = Catalog::merged(vec![m("kimi-k3", Lane::Go)], vec![]);
     let a = Allowance::new(1_000_000, 0.0);
-    assert_eq!(choose_lane("kimi-k3", &catalog, &a, None, false), Some(LaneChoice::Go));
+    assert_eq!(
+        choose_lane("kimi-k3", &catalog, &a, None, false),
+        Some(LaneChoice::Go)
+    );
 }
 
 #[test]
@@ -82,12 +85,24 @@ fn an_el_only_model_with_no_budget_is_unservable() {
     let catalog = Catalog::merged(vec![], vec![m("clef", Lane::Experiential)]);
     let mut a = Allowance::new(1_000_000, 0.0);
     a.record("org-1", 1_000_000, 0);
-    assert_eq!(choose_lane("clef", &catalog, &a, Some("org-1"), false), None);
+    assert_eq!(
+        choose_lane("clef", &catalog, &a, Some("org-1"), false),
+        None
+    );
 }
 
 #[test]
 fn an_unknown_model_is_unservable() {
-    assert_eq!(choose_lane("nope", &shared_catalog(), &Allowance::new(1, 0.0), None, false), None);
+    assert_eq!(
+        choose_lane(
+            "nope",
+            &shared_catalog(),
+            &Allowance::new(1, 0.0),
+            None,
+            false
+        ),
+        None
+    );
 }
 
 fn signal<'a>(
@@ -236,4 +251,37 @@ fn allow_paid_keeps_using_el_after_the_free_allowance_is_spent() {
         choose_lane("deepseek-v4.1-flash", &catalog, &a, Some("org-1"), true),
         Some(LaneChoice::Experiential)
     );
+}
+
+#[test]
+fn a_401_sidelines_the_key_and_fails_over() {
+    let mut cb = CircuitBreaker::new(3, 60_000);
+    let mut km = KeyManager::new(vec![key("a")]);
+    let mut allowance = Allowance::new(1_000_000, 0.0);
+    let headers = HeaderMap::new();
+    let out = classify(
+        signal(401, "{}", &headers, Provider::OpenCodeGo, None, true),
+        &mut cb,
+        &mut km,
+        &mut allowance,
+    );
+    assert_eq!(out, Attempt::Retry);
+    assert_eq!(km.get("a").unwrap().status, KeyStatus::Exhausted);
+    assert!(!km.is_selectable("a", &Default::default(), 500));
+}
+
+#[test]
+fn a_success_clears_the_error_count() {
+    let mut cb = CircuitBreaker::new(3, 60_000);
+    let mut km = KeyManager::new(vec![key("a")]);
+    km.record_error("a");
+    let mut allowance = Allowance::new(1_000_000, 0.0);
+    let headers = HeaderMap::new();
+    classify(
+        signal(200, "{}", &headers, Provider::OpenCodeGo, None, true),
+        &mut cb,
+        &mut km,
+        &mut allowance,
+    );
+    assert_eq!(km.get("a").unwrap().consecutive_errors, 0);
 }

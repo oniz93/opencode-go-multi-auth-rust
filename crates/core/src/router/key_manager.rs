@@ -147,6 +147,36 @@ impl KeyManager {
         }
     }
 
+    pub fn record_success(&mut self, id: &str) {
+        if let Some(k) = self.keys.iter_mut().find(|k| k.id == id) {
+            k.consecutive_errors = 0;
+        }
+    }
+
+    /// Whether `id` could be picked right now (enabled, not cooling, not excluded).
+    pub fn is_selectable(&self, id: &str, exclude: &HashSet<String>, now_ms: u64) -> bool {
+        self.get(id)
+            .is_some_and(|k| is_eligible(k, exclude, now_ms))
+    }
+
+    /// Bring the pool in line with `keys.toml`: new keys join, removed keys
+    /// leave, edited fields update, and each surviving key keeps its health.
+    pub fn sync_from_keyfile(&mut self, kf: &KeyFile) {
+        let fresh = KeyManager::from_keyfile(kf).keys;
+        let old = std::mem::take(&mut self.keys);
+        self.keys = fresh
+            .into_iter()
+            .map(|mut key| {
+                if let Some(prev) = old.iter().find(|k| k.id == key.id) {
+                    key.status = prev.status;
+                    key.consecutive_errors = prev.consecutive_errors;
+                    key.cooldown_until_ms = prev.cooldown_until_ms;
+                }
+                key
+            })
+            .collect();
+    }
+
     pub fn record_error(&mut self, id: &str) {
         if let Some(k) = self.keys.iter_mut().find(|k| k.id == id) {
             k.consecutive_errors += 1;

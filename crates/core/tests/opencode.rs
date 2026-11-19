@@ -86,3 +86,13 @@ fn write_creates_the_file_when_absent() {
     write_opencode_config(&cfg, &snippet()).unwrap();
     assert!(cfg.exists());
 }
+
+#[test]
+fn an_unparseable_config_is_left_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("opencode.json");
+    let jsonc = "{\n  // my settings\n  \"model\": \"openai/gpt\",\n}\n";
+    std::fs::write(&cfg, jsonc).unwrap();
+    assert!(write_opencode_config(&cfg, &snippet()).is_err());
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), jsonc);
+}

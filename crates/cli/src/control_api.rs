@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::path::PathBuf;
 
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
@@ -11,7 +12,7 @@ use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use ocrouter_core::keys::mask_secret;
+use ocrouter_core::keys::{mask_secret, KeyEntry, KeyFile};
 use ocrouter_core::models::opencode::generate_snippet;
 use ocrouter_core::provider::Provider;
 use ocrouter_core::router::types::{ApiKey, KeyStatus, RoutingStrategy};
@@ -22,6 +23,26 @@ use crate::engine::Shared;
 pub struct AppState {
     pub shared: Shared,
     pub token: String,
+    /// `keys.toml`; when set, keys added or removed here survive a restart.
+    pub keys_path: Option<PathBuf>,
+}
+
+/// Apply `change` to `keys.toml`. A no-op when no path is configured.
+fn persist_keys(state: &AppState, change: impl FnOnce(&mut KeyFile)) -> anyhow::Result<()> {
+    let Some(path) = state.keys_path.as_deref() else {
+        return Ok(());
+    };
+    let mut file = KeyFile::load(path)?;
+    change(&mut file);
+    file.save(path)
+}
+
+fn persist_error(error: anyhow::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": format!("could not update keys file: {error}") })),
+    )
+        .into_response()
 }
 
 pub struct ControlApi {
@@ -122,10 +143,18 @@ struct AddKeyRequest {
     weight: u32,
 }
 
-async fn add_key(
-    State(state): State<AppState>,
-    Json(body): Json<AddKeyRequest>,
-) -> Json<Value> {
+async fn add_key(State(state): State<AppState>, Json(body): Json<AddKeyRequest>) -> Response {
+    let entry = KeyEntry {
+        provider: body.provider,
+        label: body.label.clone(),
+        secret: body.secret.clone(),
+        priority: body.priority,
+        weight: body.weight,
+        enabled: true,
+    };
+    if let Err(error) = persist_keys(&state, |file| file.add(entry)) {
+        return persist_error(error);
+    }
     let id = ApiKey::new_id(body.provider, &body.label);
     let key = ApiKey {
         id: id.clone(),
@@ -141,26 +170,46 @@ async fn add_key(
     };
     let preview = mask_secret(&key.secret);
     state.shared.keys.lock().expect("keys poisoned").add(key);
-    Json(json!({ "id": id, "preview": preview }))
+    Json(json!({ "id": id, "preview": preview })).into_response()
 }
 
 async fn remove_key(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if let Err(error) = persist_keys(&state, |file| {
+        file.key
+            .retain(|k| ApiKey::new_id(k.provider, &k.label) != id)
+    }) {
+        return persist_error(error);
+    }
     let removed = state.shared.keys.lock().expect("keys poisoned").remove(&id);
     if removed {
         Json(json!({ "removed": id })).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "key not found" }))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "key not found" })),
+        )
+            .into_response()
     }
 }
 
 async fn test_key(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let present = state.shared.keys.lock().expect("keys poisoned").get(&id).is_some();
+    let present = state
+        .shared
+        .keys
+        .lock()
+        .expect("keys poisoned")
+        .get(&id)
+        .is_some();
     if present {
         // A live probe needs the upstream; the CLI/GUI runs it. Here we report
         // that the key exists and is selectable.
         Json(json!({ "id": id, "present": true })).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "key not found" }))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "key not found" })),
+        )
+            .into_response()
     }
 }
 
@@ -183,7 +232,7 @@ async fn status(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<Value> {
-    let catalog = state.shared.catalog.as_ref();
+    let catalog = state.shared.catalog();
     let models: Vec<Value> = catalog
         .models
         .iter()
@@ -202,7 +251,7 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn snippet(State(state): State<AppState>) -> Json<Value> {
-    let catalog = state.shared.catalog.as_ref();
+    let catalog = state.shared.catalog();
     let base = format!("http://127.0.0.1:{}/v1", state.shared.config.proxy_port);
     Json(generate_snippet(&catalog.models, &base))
 }

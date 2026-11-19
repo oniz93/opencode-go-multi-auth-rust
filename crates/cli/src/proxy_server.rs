@@ -60,11 +60,44 @@ impl ProxyServer {
     }
 }
 
+fn is_loopback_host(authority: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
+/// The proxy spends real credentials and has no auth of its own, so it only
+/// serves local programs. Browsers always send `Origin` on cross-site requests,
+/// and a DNS-rebinding page arrives with its own hostname in `Host`; both are
+/// refused. Loopback origins (a local tool's own page) are allowed.
+pub fn is_local_request(headers: &http::HeaderMap) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let host_ok = header("host").is_none_or(is_loopback_host);
+    let origin_ok = header("origin").is_none_or(|origin| {
+        origin
+            .split_once("://")
+            .is_some_and(|(_, authority)| is_loopback_host(authority))
+    });
+    host_ok && origin_ok
+}
+
 async fn handle(
     req: Request<Incoming>,
     engine: Arc<Engine>,
     client: Arc<ReqwestClient>,
 ) -> Response<RespBody> {
+    if !is_local_request(req.headers()) {
+        return into_response(ProxyOutcome {
+            status: 403,
+            headers: http::HeaderMap::new(),
+            body: ProxyBody::bytes("{\"error\":\"ocrouter only serves local clients\"}"),
+        });
+    }
     let method = req.method().to_string();
     let path = req
         .uri()
@@ -117,9 +150,7 @@ fn into_response(outcome: ProxyOutcome) -> Response<RespBody> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(16);
     pump(body, tx);
 
-    let hyper_body = BodyExt::boxed(StreamBody::new(
-        ReceiverStream::new(rx).map_ok(Frame::data),
-    ));
+    let hyper_body = BodyExt::boxed(StreamBody::new(ReceiverStream::new(rx).map_ok(Frame::data)));
 
     builder
         .body(hyper_body)
@@ -142,5 +173,53 @@ fn pump(body: ProxyBody, tx: tokio::sync::mpsc::Sender<Result<Bytes, io::Error>>
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local_request;
+
+    fn headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn local_clients_are_served() {
+        assert!(is_local_request(&headers(&[("host", "127.0.0.1:18905")])));
+        assert!(is_local_request(&headers(&[("host", "localhost:18905")])));
+        assert!(is_local_request(&headers(&[("host", "[::1]:18905")])));
+        assert!(is_local_request(&headers(&[])));
+        assert!(is_local_request(&headers(&[
+            ("host", "127.0.0.1:18905"),
+            ("origin", "http://localhost:3000"),
+        ])));
+    }
+
+    #[test]
+    fn browsers_and_rebound_hosts_are_refused() {
+        assert!(!is_local_request(&headers(&[
+            ("host", "127.0.0.1:18905"),
+            ("origin", "https://evil.example"),
+        ])));
+        assert!(!is_local_request(&headers(&[
+            ("host", "127.0.0.1:18905"),
+            ("origin", "null"),
+        ])));
+        assert!(!is_local_request(&headers(&[(
+            "host",
+            "rebind.evil.example:18905"
+        )])));
+        assert!(!is_local_request(&headers(&[(
+            "host",
+            "127.0.0.1.evil.example"
+        )])));
     }
 }

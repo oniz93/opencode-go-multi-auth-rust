@@ -17,6 +17,13 @@ use ocrouter_core::router::key_manager::KeyManager;
 use ocrouter_core::router::session_affinity::SessionAffinity;
 
 fn app_with(secret: Option<&str>) -> (axum::Router, String) {
+    app_with_keys_file(secret, None)
+}
+
+fn app_with_keys_file(
+    secret: Option<&str>,
+    keys_path: Option<std::path::PathBuf>,
+) -> (axum::Router, String) {
     let token = "test-token".to_string();
     let mut kf = KeyFile::default();
     if let Some(secret) = secret {
@@ -35,10 +42,13 @@ fn app_with(secret: Option<&str>) -> (axum::Router, String) {
         keys: Arc::new(Mutex::new(KeyManager::from_keyfile(&kf))),
         breaker: Arc::new(Mutex::new(CircuitBreaker::new(
             config.circuit_breaker_threshold,
-            config.cooldown_ms,
+            config.breaker_open_ms,
         ))),
         allowance: Arc::new(Mutex::new(Allowance::new(1_000_000, 0.05))),
-        catalog: Arc::new(Catalog::merged(vec![], vec![])),
+        catalog: Arc::new(std::sync::RwLock::new(Arc::new(Catalog::merged(
+            vec![],
+            vec![],
+        )))),
         events: EventBus::new(64),
         affinity: Arc::new(Mutex::new(SessionAffinity::new())),
         strategy: Arc::new(Mutex::new(config.strategy)),
@@ -48,6 +58,7 @@ fn app_with(secret: Option<&str>) -> (axum::Router, String) {
             AppState {
                 shared,
                 token: String::new(),
+                keys_path,
             },
             token.clone(),
         )
@@ -81,7 +92,10 @@ async fn send(
 #[tokio::test]
 async fn api_requires_the_token() {
     let (app, token) = app_with(Some("oc_VERYSECRET1234"));
-    assert_eq!(send(&app, "GET", "/api/keys", None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, "GET", "/api/keys", None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         send(&app, "GET", "/api/keys", Some("Bearer wrong")).await.0,
         StatusCode::UNAUTHORIZED
@@ -142,4 +156,36 @@ async fn status_reports_key_counts() {
     let (status, body) = send(&app, "GET", "/api/status", Some(&format!("Bearer {token}"))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("\"keys\""));
+}
+
+#[tokio::test]
+async fn keys_added_and_removed_through_the_api_are_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keys.toml");
+    let (app, token) = app_with_keys_file(None, Some(path.clone()));
+    let auth = format!("Bearer {token}");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/keys")
+                .header("authorization", &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"secret":"oc_PERSISTME","provider":"opencode-go","label":"go-9"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved = KeyFile::load(&path).unwrap();
+    assert_eq!(saved.key.len(), 1);
+    assert_eq!(saved.key[0].secret, "oc_PERSISTME");
+
+    let (status, _) = send(&app, "DELETE", "/api/keys/opencode-go:go-9", Some(&auth)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(KeyFile::load(&path).unwrap().key.is_empty());
 }

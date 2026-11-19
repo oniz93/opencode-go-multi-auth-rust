@@ -46,14 +46,12 @@ impl UpstreamClient for ReqwestClient {
                 HeaderName::from_bytes(name.as_str().as_bytes()),
                 HeaderValue::from_bytes(value.as_bytes()),
             ) {
-                headers.insert(name, value);
+                headers.append(name, value);
             }
         }
 
         let stream = response.bytes_stream();
-        let mapped = futures_util::StreamExt::map(stream, |chunk| {
-            chunk.map_err(|e| e.to_string())
-        });
+        let mapped = futures_util::StreamExt::map(stream, |chunk| chunk.map_err(|e| e.to_string()));
         Ok(ProxyResponse {
             status,
             headers,

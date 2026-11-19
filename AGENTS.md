@@ -54,13 +54,19 @@ on 1.91.
 - **Route on path and `model` only.** Never read `tools` / `messages` /
   `tool_use`.
 - **Go requires `x-opencode-session`.** Synthesise it when the client omits it
-  (`engine::resolve_session`). Missing it returns `400 MissingSessionID`.
+  (once per request in `Engine::handle`, so retries share it). Missing it
+  returns `400 MissingSessionID`.
 - **Both auth headers** go upstream for Go/Console (`Authorization` + `x-api-key`);
   Experiential gets `Authorization` only.
 - **React, do not predict.** Cooldown comes from the upstream 4xx
   (`proxy::quota`). Never add a local quota accumulator to routing.
-- **A repeated 5xx on the same body must not open a second breaker**
-  (`ResponseSignal::count_breaker_failure`).
+- **Only a request's first failure (5xx or transport error) counts against a
+  breaker** (`ResponseSignal::count_breaker_failure`). Breakers open for
+  `breaker_open_ms` (60 s), not the 5 h quota `cooldown_ms`.
+- **Never forward `accept-encoding`.** The proxy has no decompressor and must
+  read error bodies for quota markers.
+- **The proxy is local-only** (`proxy_server::is_local_request`): no browser
+  `Origin`, loopback `Host` only.
 - **No wall-clock upstream timeout** by default.
 - **The Experiential allowance is per org**, keyed on the `org_id` from
   `GET /api/whoami`, reset 00:00 UTC (`router::allowance`).

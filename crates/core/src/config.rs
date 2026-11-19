@@ -26,6 +26,9 @@ pub struct Config {
     pub el_allow_paid: bool,
     pub cooldown_ms: u64,
     pub circuit_breaker_threshold: u32,
+    /// How long an open breaker sidelines a key. Short on purpose: it guards
+    /// against transport errors and 5xx, not quota (that is `cooldown_ms`).
+    pub breaker_open_ms: u64,
     pub log_level: String,
     pub keys_path: Option<PathBuf>,
     pub state_path: Option<PathBuf>,
@@ -46,6 +49,7 @@ impl Default for Config {
             el_allow_paid: false,
             cooldown_ms: 5 * 60 * 60 * 1000,
             circuit_breaker_threshold: 3,
+            breaker_open_ms: 60_000,
             log_level: "info".to_string(),
             keys_path: None,
             state_path: None,
